@@ -16,6 +16,7 @@
 package io.prediction.tools
 
 import io.prediction.data.storage.EngineManifest
+import io.prediction.workflow.WorkflowUtils
 
 import grizzled.slf4j.Logging
 import org.apache.hadoop.conf.Configuration
@@ -30,7 +31,8 @@ object RunWorkflow extends Logging {
   def runWorkflow(
       ca: ConsoleArgs,
       core: File,
-      em: EngineManifest): Unit = {
+      em: EngineManifest,
+      variantJson: File): Unit = {
     // Collect and serialize PIO_* environmental variables
     val pioEnvVars = sys.env.filter(kv => kv._1.startsWith("PIO_")).map(kv =>
       s"${kv._1}=${kv._2}"
@@ -49,6 +51,18 @@ object RunWorkflow extends Logging {
     val hadoopConf = new Configuration
     val hdfs = FileSystem.get(hadoopConf)
 
+    val extraFiles = WorkflowUtils.thirdPartyConfFiles
+
+    val driverClassPathIndex =
+      ca.common.sparkPassThrough.indexOf("--driver-class-path")
+    val driverClassPathPrefix =
+      if (driverClassPathIndex != -1)
+        Seq(ca.common.sparkPassThrough(driverClassPathIndex + 1))
+      else
+        Seq()
+    val extraClasspaths =
+      driverClassPathPrefix ++ WorkflowUtils.thirdPartyClasspaths
+
     val workMode = ca.metricsClass.map(_ => "Evaluation").getOrElse("Training")
     val sparkSubmit =
       Seq(Seq(sparkHome, "bin", "spark-submit").mkString(File.separator)) ++
@@ -60,7 +74,16 @@ object RunWorkflow extends Logging {
         s"PredictionIO ${workMode}: ${em.id} ${em.version} (${ca.batch})",
         "--jars",
         (em.files ++ Console.builtinEngines(
-          ca.common.pioHome.get).map(_.getCanonicalPath)).mkString(","),
+          ca.common.pioHome.get).map(_.getCanonicalPath)).mkString(",")) ++
+      (if (extraFiles.size > 0)
+        Seq("--files", extraFiles.mkString(","))
+      else
+        Seq()) ++
+      (if (extraClasspaths.size > 0)
+        Seq("--driver-class-path", extraClasspaths.mkString(":"))
+      else
+        Seq()) ++
+      Seq(
         core.getCanonicalPath,
         "--env",
         pioEnvVars,
@@ -68,8 +91,14 @@ object RunWorkflow extends Logging {
         em.id,
         "--engineVersion",
         em.version,
-        "--engineFactory",
-        em.engineFactory) ++
+        "--engineVariant",
+        variantJson.getCanonicalPath) ++
+      (if (ca.common.verbose) Seq("--verbose") else Seq()) ++
+      (if (ca.common.debug) Seq("--debug") else Seq()) ++
+      (if (ca.common.skipSanityCheck) Seq("--skip-sanity-check") else Seq()) ++
+      (if (ca.common.stopAfterRead) Seq("--stop-after-read") else Seq()) ++
+      (if (ca.common.stopAfterPrepare)
+        Seq("--stop-after-prepare") else Seq()) ++
       ca.metricsClass.map(x => Seq("--metricsClass", x)).
         getOrElse(Seq()) ++
       (if (ca.batch != "") Seq("--batch", ca.batch) else Seq()) ++ Seq(

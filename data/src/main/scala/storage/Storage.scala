@@ -21,13 +21,14 @@ import scala.collection.JavaConversions._
 import scala.language.existentials
 import scala.reflect.runtime.universe._
 
-case class StorageError(val message: String)
+import scala.concurrent.ExecutionContext.Implicits.global
+
+private[prediction] case class StorageError(val message: String)
 
 /**
- * Settings accessors.
- *
- * This class ensures its users that the configuration is free of error, and
- * provides default values as necessary.
+ * Backend-agnostic data storage layer with lazy initialization and connection
+ * pooling. Use this object when you need to interface with Event Store in your
+ * engine.
  */
 object Storage extends Logging {
   private var errors = 0
@@ -53,7 +54,8 @@ object Storage extends Logging {
   private case class DataObjectMeta(sourceName: String, databaseName: String)
 
   private val s2cm = scala.collection.mutable.Map[String, Option[ClientMeta]]()
-  private def updateS2CM(k: String, parallel: Boolean): Option[ClientMeta] = {
+  private def updateS2CM(k: String, parallel: Boolean, test: Boolean):
+    Option[ClientMeta] = {
     try {
       val keyedPath = sourcesPrefixPath(k)
       val sourceType = sys.env(prefixPath(keyedPath, "TYPE"))
@@ -63,7 +65,8 @@ object Storage extends Logging {
       val clientConfig = StorageClientConfig(
         hosts = hosts,
         ports = ports,
-        parallel = parallel)
+        parallel = parallel,
+        test = test)
       val client = getClient(clientConfig, sourceType)
       Some(ClientMeta(sourceType, client))
     } catch {
@@ -76,13 +79,15 @@ object Storage extends Logging {
   }
   private def sourcesToClientMetaGet(
       source: String,
-      parallel: Boolean): Option[ClientMeta] = {
-    s2cm.getOrElseUpdate(source, updateS2CM(source, parallel))
+      parallel: Boolean,
+      test: Boolean): Option[ClientMeta] = {
+    s2cm.getOrElseUpdate(source, updateS2CM(source, parallel, test))
   }
   private def sourcesToClientMeta(
       source: String,
-      parallel: Boolean): ClientMeta =
-    sourcesToClientMetaGet(source, parallel).get
+      parallel: Boolean,
+      test: Boolean): ClientMeta =
+    sourcesToClientMetaGet(source, parallel, test).get
 
   /*
   if (sys.env.get("PIO_STORAGE_INIT_SOURCES").getOrElse(false)) {
@@ -91,10 +96,9 @@ object Storage extends Logging {
   */
 
   /** Reference to the app data repository. */
-  val AppDataRepository = "APPDATA"
-  val EventDataRepository = "EVENTDATA"
-  val ModelDataRepository = "MODELDATA"
-  val MetaDataRepository = "METADATA"
+  private val EventDataRepository = "EVENTDATA"
+  private val ModelDataRepository = "MODELDATA"
+  private val MetaDataRepository = "METADATA"
 
   private val repositoriesPrefix = "PIO_STORAGE_REPOSITORIES"
   private def repositoriesPrefixPath(body: String) =
@@ -143,7 +147,7 @@ object Storage extends Logging {
       }
     ).toMap
 
-  def getClient(
+  private def getClient(
       clientConfig: StorageClientConfig,
       pkg: String): BaseStorageClient = {
     val className = "io.prediction.data.storage." + pkg + ".StorageClient"
@@ -160,28 +164,33 @@ object Storage extends Logging {
     }
   }
 
-  def getClient(
+  private def getClient(
       sourceName: String,
-      parallel: Boolean): Option[BaseStorageClient] =
-    sourcesToClientMetaGet(sourceName, parallel).map(_.client)
+      parallel: Boolean,
+      test: Boolean): Option[BaseStorageClient] =
+    sourcesToClientMetaGet(sourceName, parallel, test).map(_.client)
 
-  def getDataObject[T](repo: String)(implicit tag: TypeTag[T]): T = {
+  private[prediction]
+  def getDataObject[T](repo: String, test: Boolean = false)
+    (implicit tag: TypeTag[T]): T = {
     val repoDOMeta = repositoriesToDataObjectMeta(repo)
     val repoDOSourceName = repoDOMeta.sourceName
-    getDataObject[T](repoDOSourceName, repoDOMeta.databaseName)
+    getDataObject[T](repoDOSourceName, repoDOMeta.databaseName, test = test)
   }
 
+  private[prediction]
   def getPDataObject[T](repo: String)(implicit tag: TypeTag[T]): T = {
     val repoDOMeta = repositoriesToDataObjectMeta(repo)
     val repoDOSourceName = repoDOMeta.sourceName
     getPDataObject[T](repoDOSourceName, repoDOMeta.databaseName)
   }
 
-  def getDataObject[T](
+  private[prediction] def getDataObject[T](
       sourceName: String,
       databaseName: String,
-      parallel: Boolean = false)(implicit tag: TypeTag[T]): T = {
-    val clientMeta = sourcesToClientMeta(sourceName, parallel)
+      parallel: Boolean = false,
+      test: Boolean = false)(implicit tag: TypeTag[T]): T = {
+    val clientMeta = sourcesToClientMeta(sourceName, parallel, test)
     val sourceType = clientMeta.sourceType
     val ctorArgs = dataObjectCtorArgs(clientMeta.client, databaseName)
     val classPrefix = clientMeta.client.prefix
@@ -214,7 +223,7 @@ object Storage extends Logging {
     }
   }
 
-  def getPDataObject[T](
+  private def getPDataObject[T](
       sourceName: String,
       databaseName: String)(implicit tag: TypeTag[T]): T =
     getDataObject[T](sourceName, databaseName, true)
@@ -225,52 +234,49 @@ object Storage extends Logging {
     Seq(client.client, dbName)
   }
 
-  def verifyAllDataObjects(): Unit = {
+  private[prediction] def verifyAllDataObjects(): Unit = {
     println("  Verifying Meta Data Backend")
     getMetaDataEngineManifests()
     getMetaDataEngineInstances()
-    getMetaDataAppkeys()
+    getMetaDataApps()
+    getMetaDataAccessKeys()
     println("  Verifying Model Data Backend")
     getModelDataModels()
     println("  Verifying Event Data Backend")
-    getEventDataEvents()
+    val eventsDb = getLEvents(test = true)
+    println("  Test write Event Store (App Id 0)")
+    // use appId=0 for testing purpose
+    eventsDb.init(0)
+    eventsDb.insert(Event(
+      event="test",
+      entityType="test",
+      entityId="test"), 0)
+    eventsDb.remove(0)
+    eventsDb.close()
   }
 
-  def getMetaDataEngineManifests(): EngineManifests =
+  private[prediction] def getMetaDataEngineManifests(): EngineManifests =
     getDataObject[EngineManifests](MetaDataRepository)
 
-  def getMetaDataEngineInstances(): EngineInstances =
+  private[prediction] def getMetaDataEngineInstances(): EngineInstances =
     getDataObject[EngineInstances](MetaDataRepository)
 
-  def getMetaDataAppkeys(): Appkeys =
-    getDataObject[Appkeys](MetaDataRepository)
+  private[prediction] def getMetaDataApps(): Apps =
+    getDataObject[Apps](MetaDataRepository)
 
-  def getModelDataModels(): Models =
+  private[prediction] def getMetaDataAccessKeys(): AccessKeys =
+    getDataObject[AccessKeys](MetaDataRepository)
+
+  private[prediction] def getModelDataModels(): Models =
     getDataObject[Models](ModelDataRepository)
 
-  /** Obtains an ItemTrends object with configured backend type. */
-  def getAppdataItemTrends(): ItemTrends =
-    getDataObject[ItemTrends](AppDataRepository)
+  private[prediction] def getLEvents(test: Boolean = false): LEvents =
+    getDataObject[LEvents](EventDataRepository, test = test)
 
-  /** Obtains a Users object with configured backend type. */
-  def getAppdataUsers(): Users =
-    getDataObject[Users](AppDataRepository)
-
-  /** Obtains an Items object with configured backend type. */
-  def getAppdataItems(): Items =
-    getDataObject[Items](AppDataRepository)
-
-  /** Obtains a U2IActions object with configured backend type. */
-  def getAppdataU2IActions(): U2IActions =
-    getDataObject[U2IActions](AppDataRepository)
-
-  def getAppdataItemSets(): ItemSets =
-    getDataObject[ItemSets](AppDataRepository)
-
-  def getEventDataEvents(): Events =
-    getDataObject[Events](EventDataRepository)
-
-  def getEventDataPEvents(): PEvents =
+  /** Obtains a data access object that returns [[Event]] related RDD data
+    * structure.
+    */
+  def getPEvents(): PEvents =
     getPDataObject[PEvents](EventDataRepository)
 
   if (errors > 0) {
@@ -279,15 +285,17 @@ object Storage extends Logging {
   }
 }
 
-trait BaseStorageClient {
+private[prediction] trait BaseStorageClient {
   val config: StorageClientConfig
   val client: AnyRef
   val prefix: String = ""
 }
 
-case class StorageClientConfig(
+private[prediction] case class StorageClientConfig(
   hosts: Seq[String],
   ports: Seq[Int],
-  parallel: Boolean = false)
+  parallel: Boolean = false,
+  test: Boolean = false) // test mode config
 
-class StorageClientException(msg: String) extends RuntimeException(msg)
+private[prediction] class StorageClientException(msg: String)
+    extends RuntimeException(msg)

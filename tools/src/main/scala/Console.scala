@@ -17,24 +17,30 @@ package io.prediction.tools
 
 import io.prediction.controller.Utils
 import io.prediction.core.BuildInfo
-import io.prediction.data.storage.Appkey
+import io.prediction.data.storage.App
+import io.prediction.data.storage.AccessKey
 import io.prediction.data.storage.EngineManifest
 import io.prediction.data.storage.EngineManifestSerializer
 import io.prediction.data.storage.Storage
+import io.prediction.data.storage.hbase.upgrade.Upgrade_0_8_3
+import io.prediction.data.storage.hbase.upgrade.CheckDistribution
 import io.prediction.tools.dashboard.Dashboard
 import io.prediction.tools.dashboard.DashboardConfig
 import io.prediction.data.api.EventServer
 import io.prediction.data.api.EventServerConfig
+import io.prediction.workflow.WorkflowUtils
 
 import grizzled.slf4j.Logging
 import org.apache.commons.io.FileUtils
 import org.json4s._
+import org.json4s.native.JsonMethods._
 import org.json4s.native.Serialization.{read, write}
 import scalaj.http.Http
 import semverfi._
 
 import scala.io.Source
 import scala.sys.process._
+import scala.util.Random
 
 import java.io.File
 import java.nio.file.Files
@@ -42,8 +48,10 @@ import java.nio.file.Files
 case class ConsoleArgs(
   common: CommonArgs = CommonArgs(),
   build: BuildArgs = BuildArgs(),
-  appkey: AppkeyArgs = AppkeyArgs(),
+  app: AppArgs = AppArgs(),
+  accessKey: AccessKeyArgs = AccessKeyArgs(),
   eventServer: EventServerArgs = EventServerArgs(),
+  upgrade: UpgradeArgs = UpgradeArgs(),
   commands: Seq[String] = Seq(),
   batch: String = "Transient Lazy Val",
   metricsClass: Option[String] = None,
@@ -65,19 +73,29 @@ case class CommonArgs(
   driverPassThrough: Seq[String] = Seq(),
   pioHome: Option[String] = None,
   sparkHome: Option[String] = None,
-  variantId: Option[String] = None,
-  variantVersion: Option[String] = None,
-  engineJson: File = new File("engine.json"))
+  engineId: Option[String] = None,
+  engineVersion: Option[String] = None,
+  variantJson: File = new File("engine.json"),
+  manifestJson: File = new File("manifest.json"),
+  stopAfterRead: Boolean = false,
+  stopAfterPrepare: Boolean = false,
+  skipSanityCheck: Boolean = false,
+  verbose: Boolean = false,
+  debug: Boolean = false)
 
 case class BuildArgs(
   sbt: Option[File] = None,
   sbtExtra: Option[String] = None,
-  sbtAssemblyPackageDependency: Boolean = false,
+  sbtAssemblyPackageDependency: Boolean = true,
   sbtClean: Boolean = false)
 
-case class AppkeyArgs(
-  appkey: String = "",
-  appid: Int = 0,
+case class AppArgs(
+  id: Option[Int] = None,
+  name: String = "",
+  description: Option[String] = None)
+
+case class AccessKeyArgs(
+  accessKey: String = "",
   events: Seq[String] = Seq())
 
 case class EventServerArgs(
@@ -85,13 +103,20 @@ case class EventServerArgs(
   ip: String = "localhost",
   port: Int = 7070)
 
+case class UpgradeArgs(
+  from: String = "0.0.0",
+  to: String = "0.0.0",
+  oldAppId: Int = 0,
+  newAppId: Int = 0
+)
+
 object Console extends Logging {
   val distFilename = "DIST"
   def main(args: Array[String]): Unit = {
     val parser = new scopt.OptionParser[ConsoleArgs]("pio") {
       override def showUsageOnError = false
       head("PredictionIO Command Line Interface Console", BuildInfo.version)
-      help("help")
+      help("")
       note("Note that it is possible to supply pass-through arguments at\n" +
         "the end of the command by using a '--' separator, e.g.\n\n" +
         "pio train --params-path params -- --master spark://mycluster:7077\n" +
@@ -109,22 +134,29 @@ object Console extends Logging {
         "        If not specified, will try to use the SPARK_HOME\n" +
         "        environmental variable. If this fails as well, default to\n" +
         "        current directory.")
-      opt[String]("variant-id") abbr("vi") action { (x, c) =>
-        c.copy(common = c.common.copy(variantId = Some(x)))
-      } text("Specify an engine variant ID. Usually used by distributed " +
+      opt[String]("engine-id") abbr("ei") action { (x, c) =>
+        c.copy(common = c.common.copy(engineId = Some(x)))
+      } text("Specify an engine ID. Usually used by distributed deployment.")
+      opt[String]("engine-version") abbr("ev") action { (x, c) =>
+        c.copy(common = c.common.copy(engineVersion = Some(x)))
+      } text("Specify an engine version. Usually used by distributed " +
         "deployment.")
-      opt[String]("variant-version") abbr("vv") action { (x, c) =>
-        c.copy(common = c.common.copy(variantVersion = Some(x)))
-      } text("Specify an engine variant version. Usually used by distributed " +
-        "deployment.")
-      opt[File]("variant-json") abbr("vj") action { (x, c) =>
-        c.copy(common = c.common.copy(engineJson = x))
+      opt[File]("variant") abbr("v") action { (x, c) =>
+        c.copy(common = c.common.copy(variantJson = x))
       } validate { x =>
         if (x.exists)
           success
         else
           failure(s"${x.getCanonicalPath} does not exist.")
       } text("Path to an engine variant JSON file. Default: engine.json")
+      opt[File]("manifest") abbr("m") action { (x, c) =>
+        c.copy(common = c.common.copy(manifestJson = x))
+      } validate { x =>
+        if (x.exists)
+          success
+        else
+          failure(s"${x.getCanonicalPath} does not exist.")
+      } text("Path to an engine manifest JSON file. Default: manifest.json")
       opt[File]("sbt") action { (x, c) =>
         c.copy(build = c.build.copy(sbt = Some(x)))
       } validate { x =>
@@ -133,24 +165,39 @@ object Console extends Logging {
         else
           failure(s"${x.getCanonicalPath} does not exist.")
       } text("Path to sbt. Default: sbt")
+      opt[Unit]("verbose") action { (x, c) =>
+        c.copy(common = c.common.copy(verbose = true))
+      }
+      opt[Unit]("debug") action { (x, c) =>
+        c.copy(common = c.common.copy(debug = true))
+      }
       note("")
       cmd("version").
         text("Displays the version of this command line console.").
         action { (_, c) =>
           c.copy(commands = c.commands :+ "version")
         }
-      //note("")
-      //cmd("new").
-      //  text("Creates a new engine project in a subdirectory with the same " +
-      //    "name as the project. The project name will also be used as the " +
-      //    "default engine ID.").
-      //  action { (_, c) =>
-      //    c.copy(commands = c.commands :+ "new")
-      //  } children(
-      //    arg[String]("<project name>") action { (x, c) =>
-      //      c.copy(projectName = Some(x))
-      //    } text("Engine project name.")
-      //  )
+      note("")
+      cmd("help").action { (_, c) =>
+        c.copy(commands = c.commands :+ "help")
+      } children(
+        arg[String]("<command>") optional()
+          action { (x, c) =>
+            c.copy(commands = c.commands :+ x)
+          }
+        )
+      note("")
+      cmd("new").
+        text("Creates a new engine project in a subdirectory with the same " +
+          "name as the project. The project name will also be used as the " +
+          "default engine ID.").
+        action { (_, c) =>
+          c.copy(commands = c.commands :+ "new")
+        } children(
+          arg[String]("<project name>") action { (x, c) =>
+            c.copy(projectName = Some(x))
+          } text("Engine project name.")
+        )
       //note("")
       //cmd("instance").
       //  text("Creates a new engine instance in a subdirectory with the same " +
@@ -177,9 +224,9 @@ object Console extends Logging {
           opt[Unit]("clean") action { (x, c) =>
             c.copy(build = c.build.copy(sbtClean = true))
           } text("Clean build."),
-          opt[Unit]("asm") action { (x, c) =>
-            c.copy(build = c.build.copy(sbtAssemblyPackageDependency = true))
-          } text("Build dependencies assembly.")
+          opt[Unit]("no-asm") action { (x, c) =>
+            c.copy(build = c.build.copy(sbtAssemblyPackageDependency = false))
+          } text("Skip building external dependencies assembly.")
         )
       //note("")
       //cmd("register").
@@ -239,7 +286,16 @@ object Console extends Logging {
           opt[String]("metrics-params") abbr("mp") action { (x, c) =>
             c.copy(metricsParamsJsonPath = Some(x))
           } text("Metrics parameters JSON file. Will try to use\n" +
-            "        metrics.json in the base path.")
+            "        metrics.json in the base path."),
+          opt[Unit]("skip-sanity-check") abbr("ssc") action { (x, c) =>
+            c.copy(common = c.common.copy(skipSanityCheck = true))
+          },
+          opt[Unit]("stop-after-read") abbr("sar") action { (x, c) =>
+            c.copy(common = c.common.copy(stopAfterRead = true))
+          },
+          opt[Unit]("stop-after-prepare") abbr("sap") action { (x, c) =>
+            c.copy(common = c.common.copy(stopAfterPrepare = true))
+          }
         )
       note("")
       cmd("eval").
@@ -304,7 +360,10 @@ object Console extends Logging {
           } text("Event server IP. Default: localhost"),
           opt[Int]("event-server-port") action { (x, c) =>
             c.copy(eventServer = c.eventServer.copy(port = x))
-          } text("Event server port. Default: 7070")
+          } text("Event server port. Default: 7070"),
+          opt[String]("accesskey") action { (x, c) =>
+            c.copy(accessKey = c.accessKey.copy(accessKey = x))
+          } text("Access key of the App where feedback data will be stored.")
         )
       note("")
       cmd("undeploy").
@@ -384,9 +443,9 @@ object Console extends Logging {
           opt[Unit]("clean") action { (x, c) =>
             c.copy(build = c.build.copy(sbtClean = true))
           } text("Clean build."),
-          opt[Unit]("asm") action { (x, c) =>
-            c.copy(build = c.build.copy(sbtAssemblyPackageDependency = true))
-          } text("Build dependencies assembly.")
+          opt[Unit]("no-asm") action { (x, c) =>
+            c.copy(build = c.build.copy(sbtAssemblyPackageDependency = false))
+          } text("Skip building external dependencies assembly.")
         )
       note("")
       cmd("status").
@@ -394,6 +453,25 @@ object Console extends Logging {
         action { (_, c) =>
           c.copy(commands = c.commands :+ "status")
         }
+      note("")
+      cmd("upgrade").
+        text("Upgrade tool").
+        action { (_, c) =>
+          c.copy(commands = c.commands :+ "upgrade")
+        } children(
+          arg[String]("<from version>") action { (x, c) =>
+            c.copy(upgrade = c.upgrade.copy(from = x))
+          } text("The version upgraded from."),
+          arg[String]("<to version>") action { (x, c) =>
+            c.copy(upgrade = c.upgrade.copy(to = x))
+          } text("The version upgraded to."),
+          arg[Int]("<old App ID>") action { (x, c) =>
+            c.copy(upgrade = c.upgrade.copy(oldAppId = x))
+          } text("Old App ID."),
+          arg[Int]("<new App ID>") action { (x, c) =>
+            c.copy(upgrade = c.upgrade.copy(newAppId = x))
+          } text("New App ID.")
+        )
       //note("")
       //cmd("dist").
       //  text("Build an engine at the current directory and create a \n" +
@@ -415,42 +493,91 @@ object Console extends Logging {
       //    } text("Build dependencies assembly.")
       //  )
       note("")
-      cmd("appkey").
-        text("Manage app keys.\n").
+      cmd("app").
+        text("Manage apps.\n").
         action { (_, c) =>
-          c.copy(commands = c.commands :+ "appkey")
+          c.copy(commands = c.commands :+ "app")
         } children(
           cmd("new").
             text("Create a new app key to app ID mapping.").
             action { (_, c) =>
               c.copy(commands = c.commands :+ "new")
             } children(
-              arg[Int]("<appid>") action { (x, c) =>
-                c.copy(appkey = c.appkey.copy(appid = x))
-              } text("The app ID to be mapped."),
-              arg[String]("<event>...") unbounded() action { (x, c) =>
-                c.copy(appkey = c.appkey.copy(events = c.appkey.events :+ x))
-              } text("Event name(s) that are allowed with this key.")
+              opt[Int]("id") action { (x, c) =>
+                c.copy(app = c.app.copy(id = Some(x)))
+              } text("Specify this if you already have data under an app ID."),
+              opt[String]("description") action { (x, c) =>
+                c.copy(app = c.app.copy(description = Some(x)))
+              } text("Specify this if you already have data under an app ID."),
+              arg[String]("<name>") action { (x, c) =>
+                c.copy(app = c.app.copy(name = x))
+              } text("App name.")
             ),
           note(""),
           cmd("list").
-            text("List all app keys in the system.").
+            text("List all apps.").
             action { (_, c) =>
               c.copy(commands = c.commands :+ "list")
-            } children(
-              opt[Int]("appid") action { (x, c) =>
-                c.copy(appkey = c.appkey.copy(appid = x))
-              } text("Restrict listing to a specific app ID.")
-            ),
+            },
           note(""),
           cmd("delete").
-            text("Delete an app key.").
+            text("Delete an app.").
             action { (_, c) =>
               c.copy(commands = c.commands :+ "delete")
             } children(
-              arg[String]("<appkey>") action { (x, c) =>
-                c.copy(appkey = c.appkey.copy(appkey = x))
-              } text("The app key to be deleted.")
+              arg[String]("<name>") action { (x, c) =>
+                c.copy(app = c.app.copy(name = x))
+              } text("Name of the app to be deleted.")
+            ),
+          note(""),
+          cmd("data-delete").
+            text("Delete data of an app").
+            action { (_, c) =>
+              c.copy(commands = c.commands :+ "data-delete")
+            } children(
+              arg[String]("<name>") action { (x, c) =>
+                c.copy(app = c.app.copy(name = x))
+              } text("Name of the app whose data to be deleted.")
+            )
+        )
+      note("")
+      cmd("accesskey").
+        text("Manage app access keys.\n").
+        action { (_, c) =>
+          c.copy(commands = c.commands :+ "accesskey")
+        } children(
+          cmd("new").
+            text("Add allowed event(s) to an access key.").
+            action { (_, c) =>
+              c.copy(commands = c.commands :+ "new")
+            } children(
+              arg[String]("<app name>") action { (x, c) =>
+                c.copy(app = c.app.copy(name = x))
+              } text("App to be associated with the new access key."),
+              arg[String]("[<event1> <event2> ...]") unbounded() optional()
+                action { (x, c) =>
+                  c.copy(accessKey = c.accessKey.copy(
+                    events = c.accessKey.events :+ x))
+                } text("Allowed event name(s) to be added to the access key.")
+            ),
+          cmd("list").
+            text("List all access keys of an app.").
+            action { (_, c) =>
+              c.copy(commands = c.commands :+ "list")
+            } children(
+              arg[String]("<app name>") optional() action { (x, c) =>
+                c.copy(app = c.app.copy(name = x))
+              } text("App name.")
+            ),
+          note(""),
+          cmd("delete").
+            text("Delete an access key.").
+            action { (_, c) =>
+              c.copy(commands = c.commands :+ "delete")
+            } children(
+              arg[String]("<access key>") action { (x, c) =>
+                c.copy(accessKey = c.accessKey.copy(accessKey = x))
+              } text("The access key to be deleted.")
             )
         )
     }
@@ -475,22 +602,29 @@ object Console extends Logging {
       val ca = pca.copy(common = pca.common.copy(
         sparkPassThrough = sparkPassThroughArgs,
         driverPassThrough = driverPassThroughArgs))
+      WorkflowUtils.setupLogging(ca.common.verbose, ca.common.debug)
       ca.commands match {
+        case Seq("") =>
+          System.err.println(help())
+          sys.exit(1)
         case Seq("version") =>
           version(ca)
         case Seq("new") =>
           createProject(ca)
-        case Seq("instance") =>
-          createInstance(ca)
+        //case Seq("instance") =>
+        //  createInstance(ca)
         case Seq("build") =>
+          regenerateManifestJson(ca.common.manifestJson)
           build(ca)
         case Seq("register") =>
           register(ca)
         case Seq("unregister") =>
           unregister(ca)
         case Seq("train") =>
+          regenerateManifestJson(ca.common.manifestJson)
           train(ca)
         case Seq("eval") =>
+          regenerateManifestJson(ca.common.manifestJson)
           train(ca)
         case Seq("deploy") =>
           deploy(ca)
@@ -501,28 +635,71 @@ object Console extends Logging {
         case Seq("eventserver") =>
           eventserver(ca)
         case Seq("compile") =>
+          generateManifestJson(ca.common.manifestJson)
           compile(ca)
         case Seq("run") =>
+          generateManifestJson(ca.common.manifestJson)
           run(ca)
         case Seq("dist") =>
           dist(ca)
         case Seq("status") =>
           status(ca)
-        case Seq("appkey", "new") =>
-          appkeyNew(ca)
-        case Seq("appkey", "list") =>
-          appkeyList(ca)
-        case Seq("appkey", "delete") =>
-          appkeyDelete(ca)
+        case Seq("upgrade") =>
+          upgrade(ca)
+        case Seq("app", "new") =>
+          appNew(ca)
+        case Seq("app", "list") =>
+          appList(ca)
+        case Seq("app", "delete") =>
+          appDelete(ca)
+        case Seq("app", "data-delete") =>
+          appDataDelete(ca)
+        case Seq("accesskey", "new") =>
+          accessKeyNew(ca)
+        case Seq("accesskey", "list") =>
+          accessKeyList(ca)
+        case Seq("accesskey", "delete") =>
+          accessKeyDelete(ca)
         case _ =>
-          error(
-            s"Unrecognized command sequence: ${ca.commands.mkString(" ")}\n")
-          System.err.println(parser.usage)
+          System.err.println(help(ca.commands))
           sys.exit(1)
       }
+      sys.exit(0)
+    } getOrElse {
+      val command = args.toSeq.filterNot(_.startsWith("--")).head
+      System.err.println(help(Seq(command)))
+      sys.exit(1)
     }
-    sys.exit(0)
   }
+
+  def help(commands: Seq[String] = Seq()) = {
+    if (commands.isEmpty) {
+      mainHelp
+    } else {
+      val stripped =
+        (if (commands.head == "help") commands.drop(1) else commands).
+          mkString("-")
+      helpText.getOrElse(stripped, s"Help is unavailable for ${stripped}.")
+    }
+  }
+
+  val mainHelp = console.txt.main().toString
+
+  val helpText = Map(
+    "" -> mainHelp,
+    "status" -> console.txt.status().toString,
+    "upgrade" -> console.txt.upgrade().toString,
+    "version" -> console.txt.version().toString,
+    "new" -> console.txt.newCommand().toString,
+    "build" -> console.txt.build().toString,
+    "train" -> console.txt.train().toString,
+    "deploy" -> console.txt.deploy().toString,
+    "eventserver" -> console.txt.eventserver().toString,
+    "app" -> console.txt.app().toString,
+    "accesskey" -> console.txt.accesskey().toString,
+    "run" -> console.txt.run().toString,
+    "eval" -> console.txt.eval().toString,
+    "dashboard" -> console.txt.dashboard().toString)
 
   def createProject(ca: ConsoleArgs): Unit = {
     val scalaEngineTemplate = Map(
@@ -532,11 +709,11 @@ object Console extends Logging {
         BuildInfo.sparkVersion),
       "engine.json" -> templates.scala.txt.engineJson(
         ca.projectName.get,
-        "0.0.1-SNAPSHOT",
-        ca.projectName.get,
         "myorg.MyEngineFactory"),
-      joinFile(Seq("params", "datasource.json")) ->
-        templates.scala.params.txt.datasourceJson(),
+      "manifest.json" -> templates.scala.txt.manifestJson(
+        ca.projectName.get,
+        "0.0.1-SNAPSHOT",
+        ca.projectName.get),
       joinFile(Seq("project", "assembly.sbt")) ->
         templates.scala.project.txt.assemblySbt(),
       joinFile(Seq("src", "main", "scala", "Engine.scala")) ->
@@ -553,6 +730,7 @@ object Console extends Logging {
     info(s"Engine project created in subdirectory ${ca.projectName.get}.")
   }
 
+  /*
   def createInstance(ca: ConsoleArgs): Unit = {
     val targetDir = ca.directoryName.getOrElse(ca.projectName.get)
     val engineId = ca.projectName.getOrElse("")
@@ -574,6 +752,7 @@ object Console extends Logging {
 
     info(s"Engine instance created in subdirectory ${targetDir}.")
   }
+  */
 
   private def writeTemplate(template: Map[String, Any], targetDir: String) = {
     try {
@@ -595,12 +774,27 @@ object Console extends Logging {
 
   def build(ca: ConsoleArgs): Unit = {
     compile(ca)
+    info("Looking for an engine...")
+    val jarFiles = jarFilesForScala
+    if (jarFiles.size == 0) {
+      error("No engine found. Your build might have failed. Aborting.")
+      sys.exit(1)
+    }
+    jarFiles foreach { f => info(s"Found ${f.getName}")}
+    val copyLocal = if (sys.env.contains("HADOOP_CONF_DIR")) {
+      info("HADOOP_CONF_DIR is set. Assuming HDFS is available.")
+      true
+    } else {
+      info("HADOOP_CONF_DIR is not set. Assuming HDFS is unavailable.")
+      false
+    }
+    RegisterEngine.registerEngine(ca.common.manifestJson, jarFiles, copyLocal)
     info("Your engine is ready for training.")
   }
 
   def register(ca: ConsoleArgs): Unit = {
     if (builtinEngineDir ||
-      !RegisterEngine.builtinEngine(ca.common.engineJson)) {
+      !RegisterEngine.builtinEngine(ca.common.manifestJson)) {
       if (!distEngineDir) compile(ca)
       info("Locating files to be registered.")
       val jarFiles = jarFilesForScala
@@ -609,49 +803,50 @@ object Console extends Logging {
         sys.exit(1)
       }
       jarFiles foreach { f => info(s"Found ${f.getName}")}
-      RegisterEngine.registerEngine(ca.common.engineJson, jarFiles)
+      RegisterEngine.registerEngine(ca.common.manifestJson, jarFiles)
     } else {
       info("Registering a built-in engine.")
       RegisterEngine.registerEngine(
-        ca.common.engineJson,
+        ca.common.manifestJson,
         builtinEngines(ca.common.pioHome.get))
     }
   }
 
   def unregister(ca: ConsoleArgs): Unit = {
-    RegisterEngine.unregisterEngine(ca.common.engineJson)
+    RegisterEngine.unregisterEngine(ca.common.manifestJson)
   }
 
   def train(ca: ConsoleArgs): Unit = {
-    info("Looking for an engine...")
-    val jarFiles = jarFilesForScala
-    if (jarFiles.size == 0) {
-      error("No engine found. Your build might have failed. Aborting.")
-      sys.exit(1)
-    }
-    jarFiles foreach { f => info(s"Found ${f.getName}")}
-    RegisterEngine.registerEngine(ca.common.engineJson, jarFiles)
     withRegisteredManifest(
-      ca.common.engineJson,
-      ca.common.variantId,
-      ca.common.variantVersion) { em =>
+      ca.common.manifestJson,
+      ca.common.engineId,
+      ca.common.engineVersion) { em =>
       RunWorkflow.runWorkflow(
         ca,
         coreAssembly(ca.common.pioHome.get),
-        em)
+        em,
+        ca.common.variantJson)
     }
   }
 
   def deploy(ca: ConsoleArgs): Unit = {
     withRegisteredManifest(
-      ca.common.engineJson,
-      ca.common.variantId,
-      ca.common.variantVersion) { em =>
+      ca.common.manifestJson,
+      ca.common.engineId,
+      ca.common.engineVersion) { em =>
+      val variantJson = parse(Source.fromFile(ca.common.variantJson).mkString)
+      val variantId = variantJson \ "id" match {
+        case JString(s) => s
+        case _ =>
+          error("Unable to read engine variant ID from " +
+            s"${ca.common.variantJson.getCanonicalPath}. Aborting.")
+          sys.exit(1)
+      }
       val engineInstances = Storage.getMetaDataEngineInstances
       val engineInstance = ca.engineInstanceId map { eid =>
         engineInstances.get(eid)
       } getOrElse {
-        engineInstances.getLatestCompleted(em.id, em.version)
+        engineInstances.getLatestCompleted(em.id, em.version, variantId)
       }
       engineInstance map { r =>
         undeploy(ca)
@@ -728,8 +923,13 @@ object Console extends Logging {
         new File(ca.common.pioHome.get))
       info(s"Going to run: ${cmd}")
       try {
-        val r = cmd.!(ProcessLogger(
-          line => info(line), line => error(line)))
+        val r =
+          if (ca.common.verbose || ca.common.debug)
+            cmd.!(ProcessLogger(line => info(line), line => error(line)))
+          else
+            cmd.!(ProcessLogger(
+              line => outputSbtError(line),
+              line => outputSbtError(line)))
         if (r != 0) {
           error(s"Return code of previous step is ${r}. Aborting.")
           sys.exit(1)
@@ -759,8 +959,13 @@ object Console extends Logging {
         s"package${asm}"
       info(s"Going to run: ${buildCmd}")
       try {
-        val r = buildCmd.!(ProcessLogger(
-          line => info(line), line => error(line)))
+        val r =
+          if (ca.common.verbose || ca.common.debug)
+          buildCmd.!(ProcessLogger(line => info(line), line => error(line)))
+          else
+          buildCmd.!(ProcessLogger(
+            line => outputSbtError(line),
+            line => outputSbtError(line)))
         if (r != 0) {
           error(s"Return code of previous step is ${r}. Aborting.")
           sys.exit(1)
@@ -774,14 +979,23 @@ object Console extends Logging {
     }
   }
 
+  private def outputSbtError(line: String): Unit = {
+    """\[.*error.*\]""".r findFirstIn line foreach { _ => error(line) }
+  }
+
   def run(ca: ConsoleArgs): Unit = {
     compile(ca)
 
+    val extraFiles = WorkflowUtils.thirdPartyConfFiles
+
     val jarFiles = jarFilesForScala
     jarFiles foreach { f => info(s"Found JAR: ${f.getName}") }
-    val allJarFiles = jarFiles ++ builtinEngines(ca.common.pioHome.get)
+    val allJarFiles = (jarFiles ++
+      builtinEngines(ca.common.pioHome.get)).map(_.getCanonicalPath)
     val cmd = s"${getSparkHome(ca.common.sparkHome)}/bin/spark-submit --jars " +
-      s"${allJarFiles.map(_.getCanonicalPath).mkString(",")} --class " +
+      s"${allJarFiles.mkString(",")} " + (if (extraFiles.size > 0)
+        s"--files ${extraFiles.mkString(",")} " else "") +
+      "--class " +
       s"${ca.mainClass.get} ${ca.common.sparkPassThrough.mkString(" ")} " +
       coreAssembly(ca.common.pioHome.get) + " " +
       ca.common.driverPassThrough.mkString(" ")
@@ -800,7 +1014,7 @@ object Console extends Logging {
 
   def dist(ca: ConsoleArgs): Unit = {
     if (builtinEngineDir ||
-      !RegisterEngine.builtinEngine(ca.common.engineJson)) {
+      !RegisterEngine.builtinEngine(ca.common.manifestJson)) {
       compile(ca)
     }
     info("Locating files to be distributed.")
@@ -816,8 +1030,8 @@ object Console extends Logging {
       info(s"Found ${f.getName}")
       FileUtils.copyFile(f, new File(libDir, f.getName))
     }
-    val engineJson = "engine.json"
-    FileUtils.copyFile(new File(engineJson), new File(distDir, engineJson))
+    val variantJson = "engine.json"
+    FileUtils.copyFile(new File(variantJson), new File(distDir, variantJson))
     val paramsDir = new File("params")
     if (paramsDir.exists)
       FileUtils.copyDirectory(paramsDir, new File(distDir, paramsDir.getName))
@@ -825,38 +1039,179 @@ object Console extends Logging {
     info(s"Successfully created distributable at: ${distDir.getCanonicalPath}")
   }
 
-  def appkeyNew(ca: ConsoleArgs): Unit = {
-    val appkeys = Storage.getMetaDataAppkeys
-    val appkey = appkeys.insert(Appkey(
-      appkey = "",
-      appid = ca.appkey.appid,
-      events = ca.appkey.events))
-    appkey map { k =>
-      info(s"Created new app key: ${k}")
+  def appNew(ca: ConsoleArgs): Unit = {
+    val apps = Storage.getMetaDataApps
+    apps.getByName(ca.app.name) map { app =>
+      error(s"App ${ca.app.name} already exists. Aborting.")
     } getOrElse {
-      error(s"Unable to create new app key.")
+      ca.app.id.map { id =>
+        apps.get(id) map { app =>
+          error(
+            s"App ID ${id} already exists and maps to the app '${app.name}'. " +
+            "Aborting.")
+          sys.exit(1)
+        }
+      }
+      val appid = apps.insert(App(
+        id = ca.app.id.getOrElse(0),
+        name = ca.app.name,
+        description = ca.app.description))
+      appid map { id =>
+        val events = Storage.getLEvents()
+        val dbInit = events.init(id)
+        if (dbInit) {
+          info(s"Initialized Event Store for this app ID: ${id}.")
+          val accessKeys = Storage.getMetaDataAccessKeys
+          val accessKey = accessKeys.insert(AccessKey(
+            key = "",
+            appid = id,
+            events = Seq()))
+          accessKey map { k =>
+            info("Created new app:")
+            info(s"      Name: ${ca.app.name}")
+            info(s"        ID: ${id}")
+            info(s"Access Key: ${k}")
+          } getOrElse {
+            error(s"Unable to create new access key.")
+          }
+        } else {
+          error(s"Unable to initialize Event Store for this app ID: ${id}.")
+        }
+        events.close()
+      } getOrElse {
+        error(s"Unable to create new app.")
+      }
     }
   }
 
-  def appkeyList(ca: ConsoleArgs): Unit = {
+  def appList(ca: ConsoleArgs): Unit = {
+    val apps = Storage.getMetaDataApps.getAll().sortBy(_.name)
+    val accessKeys = Storage.getMetaDataAccessKeys
+    val title = "Name"
+    val ak = "Access Key"
+    info(f"$title%20s |   ID | $ak%64s | Allowed Event(s)")
+    apps foreach { app =>
+      val keys = accessKeys.getByAppid(app.id)
+      keys foreach { k =>
+        val events =
+          if (k.events.size > 0) k.events.sorted.mkString(",") else "(all)"
+        info(f"${app.name}%20s | ${app.id}%4d | ${k.key}%s | ${events}%s")
+      }
+    }
+    info(s"Finished listing ${apps.size} app(s).")
+  }
+
+  def appDelete(ca: ConsoleArgs): Unit = {
+    val apps = Storage.getMetaDataApps
+    apps.getByName(ca.app.name) map { app =>
+      info(s"The following app will be deleted. Are you sure?")
+      info(s"    App Name: ${app.name}")
+      info(s"      App ID: ${app.id}")
+      info(s" Description: ${app.description}")
+      val choice = readLine("Enter 'YES' to proceed: ")
+      choice match {
+        case "YES" => {
+          val events = Storage.getLEvents()
+          if (events.remove(app.id)) {
+            info(s"Removed Event Store for this app ID: ${app.id}")
+            if (Storage.getMetaDataApps.delete(app.id))
+              info(s"Deleted app ${app.name}.")
+            else
+              error(s"Error deleting app ${app.name}.")
+          } else {
+            error(s"Error removing Event Store for this app.")
+          }
+          events.close()
+          info("Done.")
+        }
+        case _ => info("Aborted.")
+      }
+    } getOrElse {
+      error(s"App ${ca.app.name} does not exist. Aborting.")
+    }
+  }
+
+  def appDataDelete(ca: ConsoleArgs): Unit = {
+    val apps = Storage.getMetaDataApps
+    apps.getByName(ca.app.name) map { app =>
+      info(s"The data of the following app will be deleted. Are you sure?")
+      info(s"    App Name: ${app.name}")
+      info(s"      App ID: ${app.id}")
+      info(s" Description: ${app.description}")
+      val choice = readLine("Enter 'YES' to proceed: ")
+      choice match {
+        case "YES" => {
+          val events = Storage.getLEvents()
+          // remove table
+          if (events.remove(app.id)) {
+            info(s"Removed Event Store for this app ID: ${app.id}")
+          } else {
+            error(s"Error removing Event Store for this app.")
+          }
+          // re-create table
+          val dbInit = events.init(app.id)
+          if (dbInit) {
+            info(s"Initialized Event Store for this app ID: ${app.id}.")
+          } else {
+            error(s"Unable to initialize Event Store for this appId:" +
+              s" ${app.id}.")
+          }
+          events.close()
+          info("Done.")
+        }
+        case _ => info("Aborted.")
+      }
+    } getOrElse {
+      error(s"App ${ca.app.name} does not exist. Aborting.")
+    }
+  }
+
+  def accessKeyNew(ca: ConsoleArgs): Unit = {
+    val apps = Storage.getMetaDataApps
+    apps.getByName(ca.app.name) map { app =>
+      val accessKeys = Storage.getMetaDataAccessKeys
+      val accessKey = accessKeys.insert(AccessKey(
+        key = "",
+        appid = app.id,
+        events = ca.accessKey.events))
+      accessKey map { k =>
+        info(s"Created new access key: ${k}")
+      } getOrElse {
+        error(s"Unable to create new access key.")
+      }
+    } getOrElse {
+      error(s"App ${ca.app.name} does not exist. Aborting.")
+    }
+  }
+
+  def accessKeyList(ca: ConsoleArgs): Unit = {
     val keys =
-      if (ca.appkey.appid == 0)
-        Storage.getMetaDataAppkeys.getAll
-      else
-        Storage.getMetaDataAppkeys.getByAppid(ca.appkey.appid)
-    val title = "Appkey"
+      if (ca.app.name == "")
+        Storage.getMetaDataAccessKeys.getAll
+      else {
+        val apps = Storage.getMetaDataApps
+        apps.getByName(ca.app.name) map { app =>
+          Storage.getMetaDataAccessKeys.getByAppid(app.id)
+        } getOrElse {
+          error(s"App ${ca.app.name} does not exist. Aborting.")
+          sys.exit(1)
+        }
+      }
+    val title = "Access Key(s)"
     info(f"$title%64s | App ID | Allowed Event(s)")
-    keys foreach { k =>
-      info(f"${k.appkey}%s | ${k.appid}%6d | ${k.events.mkString(",")}%s")
+    keys.sortBy(k => k.appid) foreach { k =>
+      val events =
+        if (k.events.size > 0) k.events.sorted.mkString(",") else "(all)"
+      info(f"${k.key}%s | ${k.appid}%6d | ${events}%s")
     }
-    info(s"Finished listing ${keys.size} app key(s).")
+    info(s"Finished listing ${keys.size} access key(s).")
   }
 
-  def appkeyDelete(ca: ConsoleArgs): Unit = {
-    if (Storage.getMetaDataAppkeys.delete(ca.appkey.appkey))
-      info(s"Deleted app key ${ca.appkey.appkey}.")
+  def accessKeyDelete(ca: ConsoleArgs): Unit = {
+    if (Storage.getMetaDataAccessKeys.delete(ca.accessKey.accessKey))
+      info(s"Deleted access key ${ca.accessKey.accessKey}.")
     else
-      error(s"Error deleting app key ${ca.appkey.appkey}.")
+      error(s"Error deleting access key ${ca.accessKey.accessKey}.")
   }
 
   def status(ca: ConsoleArgs): Unit = {
@@ -873,7 +1228,7 @@ object Console extends Logging {
     if (new File(s"${sparkHome}/bin/spark-submit").exists) {
       println(s"Apache Spark")
       println(s"  Installed at: ${sparkHome}")
-      val sparkMinVersion = "1.1.0"
+      val sparkMinVersion = "1.2.0"
       val sparkReleaseFile = new File(s"${sparkHome}/RELEASE")
       if (sparkReleaseFile.exists) {
         val sparkReleaseStrings =
@@ -914,6 +1269,17 @@ object Console extends Logging {
     println("(sleeping 5 seconds for all messages to show up...)")
     Thread.sleep(5000)
     println("Your system is all ready to go.")
+  }
+
+  def upgrade(ca: ConsoleArgs): Unit = {
+    (ca.upgrade.from, ca.upgrade.to) match {
+      case ("0.8.2", "0.8.3") => {
+        Upgrade_0_8_3.runMain(ca.upgrade.oldAppId, ca.upgrade.newAppId)
+      }
+      case _ =>
+        println(s"Upgrade from version ${ca.upgrade.from} to ${ca.upgrade.to}"
+          + s" is not supported.")
+    }
   }
 
   def coreAssembly(pioHome: String): File = {
@@ -961,7 +1327,53 @@ object Console extends Logging {
     }
   }
 
-  def readEngineJson(json: File): EngineManifest = {
+  val manifestAutogenTag = "pio-autogen-manifest"
+
+  def regenerateManifestJson(json: File): Unit = {
+    val cwd = sys.props("user.dir")
+    val ha = java.security.MessageDigest.getInstance("SHA-1").
+      digest(cwd.getBytes).map("%02x".format(_)).mkString
+    if (json.exists) {
+      val em = readManifestJson(json)
+      if (em.description == Some(manifestAutogenTag) && ha != em.version) {
+        warn("This engine project directory contains an auto-generated " +
+          "manifest that has been copied/moved from another location. ")
+        warn("Regenerating the manifest to reflect the updated location. " +
+          "This will dissociate with all previous engine instances.")
+        generateManifestJson(json)
+      } else {
+        info(s"Using existing engine manifest JSON at ${json.getCanonicalPath}")
+      }
+    } else {
+      generateManifestJson(json)
+    }
+  }
+
+  def generateManifestJson(json: File): Unit = {
+    val cwd = sys.props("user.dir")
+    implicit val formats = Utils.json4sDefaultFormats +
+      new EngineManifestSerializer
+    val rand = Random.alphanumeric.take(32).mkString
+    val ha = java.security.MessageDigest.getInstance("SHA-1").
+      digest(cwd.getBytes).map("%02x".format(_)).mkString
+    val em = EngineManifest(
+      id = rand,
+      version = ha,
+      name = new File(cwd).getName,
+      description = Some(manifestAutogenTag),
+      files = Seq(),
+      engineFactory = "")
+    try {
+      FileUtils.writeStringToFile(json, write(em), "ISO-8859-1")
+    } catch {
+      case e: java.io.IOException =>
+        error(s"Cannot generate ${json} automatically (${e.getMessage}). " +
+          "Aborting.")
+        sys.exit(1)
+    }
+  }
+
+  def readManifestJson(json: File): EngineManifest = {
     implicit val formats = Utils.json4sDefaultFormats +
       new EngineManifestSerializer
     try {
@@ -979,17 +1391,19 @@ object Console extends Logging {
 
   def withRegisteredManifest(
       json: File,
-      variantId: Option[String],
-      variantVersion: Option[String])(
+      engineId: Option[String],
+      engineVersion: Option[String])(
       op: EngineManifest => Unit): Unit = {
-    val ej = readEngineJson(json)
-    val id = variantId getOrElse ej.id
-    val version = variantVersion getOrElse ej.version
+    val ej = readManifestJson(json)
+    val id = engineId getOrElse ej.id
+    val version = engineVersion getOrElse ej.version
     Storage.getMetaDataEngineManifests.get(id, version) map {
       op
     } getOrElse {
-      error(s"Engine variant ${id} ${version} cannot be found in the system.")
-      error("Have you run the 'build' command to build your engine yet?")
+      error(s"Engine ${id} ${version} cannot be found in the system.")
+      error("Possible reasons:")
+      error("- the engine is not yet built by the 'build' command;")
+      error("- the meta data store is offline.")
       sys.exit(1)
     }
   }

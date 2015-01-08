@@ -21,7 +21,7 @@ import io.prediction.controller.Engine
 import io.prediction.controller.PAlgorithm
 import io.prediction.controller.Params
 import io.prediction.controller.ParamsWithAppId
-import io.prediction.controller.QueryWithPredictionKey
+import io.prediction.controller.WithPrId
 import io.prediction.controller.Utils
 import io.prediction.controller.java.LJavaAlgorithm
 import io.prediction.controller.java.LJavaServing
@@ -86,11 +86,15 @@ case class ServerConfig(
   port: Int = 8000,
   feedback: Boolean = false,
   eventServerIp: String = "localhost",
-  eventServerPort: Int = 7070)
+  eventServerPort: Int = 7070,
+  accessKey: Option[String] = None,
+  verbose: Boolean = false,
+  debug: Boolean = false)
 
 case class StartServer()
 case class StopServer()
 case class ReloadServer()
+case class UpgradeCheck()
 
 object CreateServer extends Logging {
   val actorSystem = ActorSystem("pio-server")
@@ -124,16 +128,31 @@ object CreateServer extends Logging {
       opt[Int]("event-server-port") action { (x, c) =>
         c.copy(eventServerPort = x)
       } text("Event server port. Default: 7070")
+      opt[String]("accesskey") action { (x, c) =>
+        c.copy(accessKey = Some(x))
+      } text("Event server access key.")
+      opt[Unit]("verbose") action { (x, c) =>
+        c.copy(verbose = true)
+      } text("Enable verbose output.")
+      opt[Unit]("debug") action { (x, c) =>
+        c.copy(debug = true)
+      } text("Enable debug output.")
     }
 
     parser.parse(args, ServerConfig()) map { sc =>
+      WorkflowUtils.setupLogging(sc.verbose, sc.debug)
       engineInstances.get(sc.engineInstanceId) map { engineInstance =>
         val engineId = sc.engineId.getOrElse(engineInstance.engineId)
         val engineVersion = sc.engineVersion.getOrElse(
           engineInstance.engineVersion)
         engineManifests.get(engineId, engineVersion) map { manifest =>
-          WorkflowUtils.checkUpgrade("deployment")
-          val engineFactoryName = manifest.engineFactory
+          val upgrade = actorSystem.actorOf(Props[UpgradeActor], "upgrade")
+          actorSystem.scheduler.schedule(
+            0.seconds,
+            1.days,
+            upgrade,
+            UpgradeCheck())
+          val engineFactoryName = engineInstance.engineFactory
           val master = actorSystem.actorOf(Props(
             classOf[MasterActor],
             sc,
@@ -153,10 +172,10 @@ object CreateServer extends Logging {
     }
   }
 
-  def createServerActorWithEngine[TD, DP, PD, Q, P, A](
+  def createServerActorWithEngine[TD, EIN, PD, Q, P, A](
     sc: ServerConfig,
     engineInstance: EngineInstance,
-    engine: Engine[TD, DP, PD, Q, P, A],
+    engine: Engine[TD, EIN, PD, Q, P, A],
     engineLanguage: EngineLanguage.Value,
     manifest: EngineManifest): ActorRef = {
     implicit val formats = DefaultFormats
@@ -177,46 +196,89 @@ object CreateServer extends Logging {
       Doer(engine.algorithmClassMap(n), p)
     }
 
-    val servingParams =
+    val servingParamsWithName: (String, Params) = {
+      val (name, params) = read[(String, JValue)](engineInstance.servingParams)
+      if (!engine.servingClassMap.contains(name)) {
+        error(s"Unable to find serving class with name '${name}'" +
+          " defined in Engine.")
+        sys.exit(1)
+      }
+      val extractedParams = WorkflowUtils.extractParams(
+        engineLanguage,
+        compact(render(params)),
+        engine.servingClassMap(name))
+      (name, extractedParams)
+    }
+
+    /*val servingParams =
       if (engineInstance.servingParams == "")
         EmptyParams()
       else
         WorkflowUtils.extractParams(
           engineLanguage,
           engineInstance.servingParams,
-          engine.servingClass)
-    val serving = Doer(engine.servingClass, servingParams)
+          engine.servingClass) */
+    val serving = Doer(engine.servingClassMap(servingParamsWithName._1),
+      servingParamsWithName._2)
 
-    val pAlgorithmExists =
-      algorithms.exists(alg => alg.isInstanceOf[PAlgorithm[_, PD, _, Q, P]]
-          || alg.isInstanceOf[PJavaAlgorithm[_, PD, _, Q, P]])
     val sparkContext =
-      if (pAlgorithmExists)
-        Some(WorkflowContext(engineInstance.batch, engineInstance.env))
-      else
-        None
-    val dataSourceParams = WorkflowUtils.extractParams(
+      Option(WorkflowContext(engineInstance.batch, engineInstance.env)).
+        filter(_ => algorithms.exists(_.isParallel))
+    /*val dataSourceParams = WorkflowUtils.extractParams(
       engineLanguage,
       engineInstance.dataSourceParams,
-      engine.dataSourceClass)
+      engine.dataSourceClass)*/
+    val dataSourceParamsWithName: (String, Params) = {
+      val (name, params) =
+        read[(String, JValue)](engineInstance.dataSourceParams)
+      if (!engine.dataSourceClassMap.contains(name)) {
+        error(s"Unable to find datasource class with name '${name}'" +
+          " defined in Engine.")
+        sys.exit(1)
+      }
+      val extractedParams = WorkflowUtils.extractParams(
+        engineLanguage,
+        compact(render(params)),
+        engine.dataSourceClassMap(name))
+      (name, extractedParams)
+    }
+    /*val preparatorParams = WorkflowUtils.extractParams(
+      engineLanguage,
+      engineInstance.preparatorParams,
+      engine.preparatorClass)*/
+    val preparatorParamsWithName: (String, Params) = {
+      val (name, params) =
+        read[(String, JValue)](engineInstance.preparatorParams)
+      if (!engine.preparatorClassMap.contains(name)) {
+        error(s"Unable to find preparator class with name '${name}'" +
+          " defined in Engine.")
+        sys.exit(1)
+      }
+      val extractedParams = WorkflowUtils.extractParams(
+        engineLanguage,
+        compact(render(params)),
+        engine.preparatorClassMap(name))
+      (name, extractedParams)
+    }
+
     val evalPreparedMap = sparkContext map { sc =>
       logger.info("Data Source")
-      val dataSource = Doer(engine.dataSourceClass, dataSourceParams)
+      val dataSource = Doer(
+        engine.dataSourceClassMap(dataSourceParamsWithName._1),
+        dataSourceParamsWithName._2)
       val evalParamsDataMap
-      : Map[EI, (DP, TD, RDD[(Q, A)])] = dataSource
+      : Map[EI, (TD, EIN, RDD[(Q, A)])] = dataSource
         .readBase(sc)
         .zipWithIndex
         .map(_.swap)
         .toMap
       val evalDataMap: Map[EI, (TD, RDD[(Q, A)])] = evalParamsDataMap.map {
-        case(ei, e) => (ei -> (e._2, e._3))
+        case(ei, e) => (ei -> (e._1, e._3))
       }
       logger.info("Preparator")
-      val preparatorParams = WorkflowUtils.extractParams(
-        engineLanguage,
-        engineInstance.preparatorParams,
-        engine.preparatorClass)
-      val preparator = Doer(engine.preparatorClass, preparatorParams)
+      val preparator = Doer(
+        engine.preparatorClassMap(preparatorParamsWithName._1),
+        preparatorParamsWithName._2)
 
       val evalPreparedMap: Map[EI, PD] = evalDataMap
       .map{ case (ei, data) => (ei, preparator.prepareBase(sc, data._1)) }
@@ -236,14 +298,13 @@ object CreateServer extends Logging {
           if (m.isInstanceOf[PersistentModelManifest]) {
             info("Custom-persisted model detected for algorithm " +
               a.getClass.getName)
-            WorkflowUtils.getPersistentModel(
+            SparkWorkflowUtils.getPersistentModel(
               m.asInstanceOf[PersistentModelManifest],
               engineInstance.id,
               p,
               sparkContext,
               getClass.getClassLoader)
-          } else if (a.isInstanceOf[PAlgorithm[_, _, _, Q, P]]
-              || a.isInstanceOf[PJavaAlgorithm[_, _, _, Q, P]]) {
+          } else if (a.isParallel) {
             info(s"Parallel model detected for algorithm ${a.getClass.getName}")
             a.trainBase(sparkContext.get, evalPreparedMap.get(0))
           } else {
@@ -267,12 +328,22 @@ object CreateServer extends Logging {
         engine,
         engineLanguage,
         manifest,
-        dataSourceParams,
+        dataSourceParamsWithName._2,
+        preparatorParamsWithName._2,
         algorithms,
         algorithmsParams,
         models,
         serving,
-        servingParams))
+        servingParamsWithName._2))
+  }
+}
+
+class UpgradeActor() extends Actor {
+  val log = Logging(context.system, this)
+  implicit val system = context.system
+  def receive = {
+    case x: UpgradeCheck =>
+      WorkflowUtils.checkUpgrade("deployment")
   }
 }
 
@@ -308,7 +379,8 @@ class MasterActor(
       val latestEngineInstance =
         CreateServer.engineInstances.getLatestCompleted(
           manifest.id,
-          manifest.version)
+          manifest.version,
+          engineInstance.engineVariant)
       latestEngineInstance map { lr =>
         val actor = createServerActor(sc, lr, engineFactoryName, manifest)
         sprayHttpListener.map { l =>
@@ -355,28 +427,27 @@ class ServerActor[Q, P](
     val engineLanguage: EngineLanguage.Value,
     val manifest: EngineManifest,
     val dataSourceParams: Params,
-    val algorithms: Seq[BaseAlgorithm[_ <: Params, _, _, Q, P]],
+    val preparatorParams: Params,
+    val algorithms: Seq[BaseAlgorithm[_, _, Q, P]],
     val algorithmsParams: Seq[Params],
     val models: Seq[Any],
-    val serving: BaseServing[_ <: Params, Q, P],
+    val serving: BaseServing[Q, P],
     val servingParams: Params) extends Actor with HttpService {
   val serverStartTime = DateTime.now
   lazy val gson = new Gson
   val log = Logging(context.system, this)
-  val (javaAlgorithms, scalaAlgorithms) =
-    algorithms.partition(alg => alg.isInstanceOf[LJavaAlgorithm[_, _, _, Q, P]]
-                             || alg.isInstanceOf[PJavaAlgorithm[_, _, _, Q, P]])
+  val (javaAlgorithms, scalaAlgorithms) = algorithms.partition(_.isJava)
 
   def actorRefFactory = context
 
   def receive = runRoute(myRoute)
 
   val feedbackEnabled = if (args.feedback) {
-    if (dataSourceParams.isInstanceOf[ParamsWithAppId]) true else {
-      log.warning("Feedback loop cannot be enabled because " +
-        dataSourceParams.getClass.getName +
-        " does not contain an app ID (not an instance of ParamsWithAppId).")
+    if (args.accessKey.isEmpty) {
+      log.error("Feedback loop cannot be enabled because accessKey is empty.")
       false
+    } else {
+      true
     }
   } else false
 
@@ -393,6 +464,8 @@ class ServerActor[Q, P](
                 algorithms.map(_.toString),
                 algorithmsParams.map(_.toString),
                 models.map(_.toString),
+                dataSourceParams.toString,
+                preparatorParams.toString,
                 servingParams.toString,
                 serverStartTime,
                 feedbackEnabled,
@@ -409,37 +482,33 @@ class ServerActor[Q, P](
           entity(as[String]) { queryString =>
             try {
               val queryTime = DateTime.now
-              val javaQuery = if (!javaAlgorithms.isEmpty) {
-                val alg = javaAlgorithms.head
+              val javaQuery = javaAlgorithms.headOption map { alg =>
                 val queryClass = if (
-                    alg.isInstanceOf[LJavaAlgorithm[_, _, _, Q, P]]) {
-                  alg.asInstanceOf[LJavaAlgorithm[_, _, _, Q, P]].queryClass
+                  alg.isInstanceOf[LJavaAlgorithm[_, _, Q, P]]) {
+                  alg.asInstanceOf[LJavaAlgorithm[_, _, Q, P]].queryClass
                 } else {
-                  alg.asInstanceOf[PJavaAlgorithm[_, _, _, Q, P]].queryClass
+                  alg.asInstanceOf[PJavaAlgorithm[_, _, Q, P]].queryClass
                 }
-                Some(gson.fromJson(
-                  queryString,
-                  queryClass))
-              } else None
-              val scalaQuery = if (!scalaAlgorithms.isEmpty) {
-                Some(Extraction.extract(parse(queryString))(
-                  scalaAlgorithms.head.querySerializer,
-                  scalaAlgorithms.head.queryManifest))
-              } else None
+                gson.fromJson(queryString, queryClass)
+              }
+              val scalaQuery = scalaAlgorithms.headOption map { alg =>
+                Extraction.extract(parse(queryString))(
+                  alg.querySerializer, alg.queryManifest)
+              }
               val predictions = algorithms.zipWithIndex.map { case (a, ai) =>
-                if (a.isInstanceOf[LJavaAlgorithm[_, _, _, Q, P]]
-                    || a.isInstanceOf[PJavaAlgorithm[_, _, _, Q, P]])
+                if (a.isJava)
                   a.predictBase(models(ai), javaQuery.get)
                 else
                   a.predictBase(models(ai), scalaQuery.get)
               }
-              val r = if (serving.isInstanceOf[LJavaServing[_, Q, P]]) {
+              val r = if (serving.isInstanceOf[LJavaServing[Q, P]]) {
                 val prediction = serving.serveBase(javaQuery.get, predictions)
-                (gson.toJson(prediction), prediction, javaQuery.get)
+                // parse to Json4s JObject for later merging with prId
+                (parse(gson.toJson(prediction)), prediction, javaQuery.get)
               } else {
                 val prediction = serving.serveBase(scalaQuery.get, predictions)
-                (compact(render(Extraction.decompose(prediction)(
-                  scalaAlgorithms.head.querySerializer))),
+                (Extraction.decompose(prediction)(
+                  scalaAlgorithms.head.querySerializer),
                   prediction,
                   scalaQuery.get)
               }
@@ -449,47 +518,69 @@ class ServerActor[Q, P](
                 * - engineInstanceId
                 * - query
                 * - prediction
-                * - predictionKey
+                * - prId
                 */
-              if (feedbackEnabled) {
+              val result = if (feedbackEnabled) {
                 implicit val formats =
                   if (!scalaAlgorithms.isEmpty)
                     scalaAlgorithms.head.querySerializer
                   else
                     Utils.json4sDefaultFormats
-                val key = Random.alphanumeric.take(64).mkString
-                val predictionKey =
-                  if (r._3.isInstanceOf[QueryWithPredictionKey]) {
-                    Map("predictionKey" ->
-                      r._3.asInstanceOf[QueryWithPredictionKey].predictionKey)
+                //val genPrId = Random.alphanumeric.take(64).mkString
+                def genPrId: String = Random.alphanumeric.take(64).mkString
+                val newPrId = if (r._2.isInstanceOf[WithPrId]) {
+                  val org = r._2.asInstanceOf[WithPrId].prId
+                  if (org.isEmpty) genPrId else org
+                } else genPrId
+
+                // also save Query's prId as prId of this pio_pr predict events
+                val queryPrId =
+                  if (r._3.isInstanceOf[WithPrId]) {
+                    Map("prId" ->
+                      r._3.asInstanceOf[WithPrId].prId)
                   } else {
                     Map()
                   }
                 val data = Map(
-                  "appId" ->
-                    dataSourceParams.asInstanceOf[ParamsWithAppId].appId,
+                  //"appId" ->
+                  //  dataSourceParams.asInstanceOf[ParamsWithAppId].appId,
                   "event" -> "predict",
                   "eventTime" -> queryTime.toString(),
-                  "entityType" -> "prediction",
-                  "entityId" -> key,
+                  "entityType" -> "pio_pr", // prediction result
+                  "entityId" -> newPrId,
                   "properties" -> Map(
                     "engineInstanceId" -> engineInstance.id,
                     "query" -> r._3,
-                    "prediction" -> r._2)) ++ predictionKey
+                    "prediction" -> r._2)) ++ queryPrId
+                // At this point args.accessKey should be Some(String).
+                val accessKey = args.accessKey.getOrElse("")
                 val f: Future[Int] = future {
                   scalaj.http.Http.postData(
                     s"http://${args.eventServerIp}:${args.eventServerPort}/" +
-                    "events.json", write(data)).
+                    s"events.json?accessKey=$accessKey", write(data)).
                     header("content-type", "application/json").responseCode
                 }
                 f onComplete {
-                  case Success(code) => Unit
-                  case Failure(t) =>
-                    log.error(s"Feedback event failed: ${t.getMessage}")
+                  case Success(code) => {
+                    if (code != 201) {
+                      log.error(s"Feedback event failed. Status code: ${code}."
+                        + s"Data: ${write(data)}.")
+                    }
+                  }
+                  case Failure(t) => {
+                    log.error(s"Feedback event failed: ${t.getMessage}") }
                 }
-              }
+                // overwrite prId in predictedResult
+                // - if it is WithPrId,
+                //   then overwrite with new prId
+                // - if it is not WithPrId, no prId injection
+                if (r._2.isInstanceOf[WithPrId])
+                  r._1 merge parse(s"""{"prId" : "${newPrId}"}""")
+                else r._1
+              } else r._1
+
               respondWithMediaType(`application/json`) {
-                complete(r._1)
+                complete(compact(render(result)))
               }
             } catch {
               case e: MappingException =>

@@ -30,6 +30,7 @@ import org.json4s.native.Serialization
  * @param endTime End time of the training/evaluation.
  * @param engineId Engine ID of the instance.
  * @param engineVersion Engine version of the instance.
+ * @param engineVariant Engine variant ID of the instance.
  * @param engineFactory Engine factory class for the instance.
  * @param evaluatorClass Name of evaluator class of the evaluation of this instance.
  * @param batch A batch label of the engine instance.
@@ -43,13 +44,14 @@ import org.json4s.native.Serialization
  * @param multipleMetricsResultsHTML HTML results of metrics on all data sets.
  * @param multipleMetricsResultsJSON JSON results of metrics on all data sets.
  */
-case class EngineInstance(
+private[prediction] case class EngineInstance(
   id: String,
   status: String,
   startTime: DateTime,
   endTime: DateTime,
   engineId: String,
   engineVersion: String,
+  engineVariant: String,
   engineFactory: String,
   evaluatorClass: String,
   batch: String,
@@ -72,7 +74,7 @@ case class EngineInstance(
  * Base trait for implementations that interact with EngineInstances in the
  * backend app data store.
  */
-trait EngineInstances {
+private[prediction] trait EngineInstances {
   /** Insert a new EngineInstance. */
   def insert(i: EngineInstance): String
 
@@ -82,8 +84,10 @@ trait EngineInstances {
   /** Get an instance that has started training the latest and has trained to
     * completion.
     */
-  def getLatestCompleted(engineId: String, engineVersion: String):
-    Option[EngineInstance]
+  def getLatestCompleted(
+      engineId: String,
+      engineVersion: String,
+      engineVariant: String): Option[EngineInstance]
 
   /** Get instances that are produced by evaluation and have run to completion,
     * reverse sorted by the start time.
@@ -97,7 +101,8 @@ trait EngineInstances {
   def delete(id: String): Unit
 }
 
-class EngineInstanceSerializer extends CustomSerializer[EngineInstance](
+private[prediction] class EngineInstanceSerializer
+    extends CustomSerializer[EngineInstance](
   format => ({
     case JObject(fields) =>
       implicit val formats = DefaultFormats
@@ -108,6 +113,7 @@ class EngineInstanceSerializer extends CustomSerializer[EngineInstance](
           endTime = DateTime.now,
           engineId = "",
           engineVersion = "",
+          engineVariant = "",
           engineFactory = "",
           evaluatorClass = "",
           batch = "",
@@ -132,6 +138,8 @@ class EngineInstanceSerializer extends CustomSerializer[EngineInstance](
             i.copy(engineId = engineId)
           case JField("engineVersion", JString(engineVersion)) =>
             i.copy(engineVersion = engineVersion)
+          case JField("engineVariant", JString(engineVariant)) =>
+            i.copy(engineVariant = engineVariant)
           case JField("engineFactory", JString(engineFactory)) =>
             i.copy(engineFactory = engineFactory)
           case JField("metricsClass", JString(evaluatorClass)) =>
@@ -171,6 +179,7 @@ class EngineInstanceSerializer extends CustomSerializer[EngineInstance](
         JField("endTime", JString(i.endTime.toString)) ::
         JField("engineId", JString(i.engineId)) ::
         JField("engineVersion", JString(i.engineVersion)) ::
+        JField("engineVariant", JString(i.engineVariant)) ::
         JField("engineFactory", JString(i.engineFactory)) ::
         JField("metricsClass", JString(i.evaluatorClass)) ::
         JField("batch", JString(i.batch)) ::
@@ -180,7 +189,7 @@ class EngineInstanceSerializer extends CustomSerializer[EngineInstance](
         JField("algorithmsParams", JString(i.algorithmsParams)) ::
         JField("servingParams", JString(i.servingParams)) ::
         JField("metricsParams", JString(i.evaluatorParams)) ::
-        JField("multipleMetricsResults", 
+        JField("multipleMetricsResults",
           JString(i.evaluatorResults)) ::
         JField("multipleMetricsResultsHTML",
           JString(i.evaluatorResultsHTML)) ::

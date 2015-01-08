@@ -31,12 +31,26 @@ import scala.reflect.ClassTag
   * @param batch Batch label of the run.
   * @param verbose Verbosity level.
   * @param saveModel Controls whether trained models are persisted.
+  * @param sparkEnv Spark properties that will be set in SparkConf.setAll().
+  * @param skipSanityCheck Skips all data sanity check.
+  * @param stopAfterRead Stops workflow after reading from data source.
+  * @param stopAfterPrepare Stops workflow after data preparation.
   * @group Workflow
   */
 case class WorkflowParams(
   batch: String = "",
   verbose: Int = 2,
-  saveModel: Boolean = true)
+  saveModel: Boolean = true,
+  sparkEnv: Map[String, String] =
+    Map[String, String]("spark.executor.extraClassPath" -> "."),
+  skipSanityCheck: Boolean = false,
+  stopAfterRead: Boolean = false,
+  stopAfterPrepare: Boolean = false) {
+  // Temporary workaround for WorkflowParamsBuilder for Java. It doesn't support
+  // custom spark environment yet.
+  def this(batch: String, verbose: Int, saveModel: Boolean)
+  = this(batch, verbose, saveModel, Map[String, String]())
+}
 
 /** Collection of workflow creation methods.
   * @group Workflow
@@ -44,7 +58,7 @@ case class WorkflowParams(
 object Workflow {
   /** Creates a workflow that runs an engine.
     *
-    * @tparam DP Data preparator class.
+    * @tparam EI Evalution info class.
     * @tparam TD Training data class.
     * @tparam PD Prepared data class.
     * @tparam Q Input query class.
@@ -60,25 +74,25 @@ object Workflow {
     * @param evaluatorParams Evaluator parameters.
     */
   def runEngine[
-      DP, TD, PD, Q, P, A,
+      EI, TD, PD, Q, P, A,
       MU : ClassTag, MR : ClassTag, MMR <: AnyRef :ClassTag
       ](
       params: WorkflowParams = WorkflowParams(),
-      engine: Engine[TD, DP, PD, Q, P, A],
+      engine: Engine[TD, EI, PD, Q, P, A],
       engineParams: EngineParams,
       evaluatorClassOpt
-        : Option[Class[_ <: BaseEvaluator[_ <: Params, DP, Q, P, A, MU, MR, MMR]]]
+        : Option[Class[_ <: BaseEvaluator[EI, Q, P, A, MU, MR, MMR]]]
         = None,
       evaluatorParams: Params = EmptyParams()) {
 
     run(
-      dataSourceClassOpt = Some(engine.dataSourceClass),
+      dataSourceClassMapOpt = Some(engine.dataSourceClassMap),
       dataSourceParams = engineParams.dataSourceParams,
-      preparatorClassOpt = Some(engine.preparatorClass),
+      preparatorClassMapOpt = Some(engine.preparatorClassMap),
       preparatorParams = engineParams.preparatorParams,
       algorithmClassMapOpt = Some(engine.algorithmClassMap),
       algorithmParamsList = engineParams.algorithmParamsList,
-      servingClassOpt = Some(engine.servingClass),
+      servingClassMapOpt = Some(engine.servingClassMap),
       servingParams = engineParams.servingParams,
       evaluatorClassOpt = evaluatorClassOpt,
       evaluatorParams = evaluatorParams,
@@ -88,7 +102,7 @@ object Workflow {
 
   /** Creates a workflow that runs a collection of engine components.
     *
-    * @tparam DP Data preparator class.
+    * @tparam EI Evalution info class.
     * @tparam TD Training data class.
     * @tparam PD Prepared data class.
     * @tparam Q Input query class.
@@ -97,48 +111,48 @@ object Workflow {
     * @tparam MU Evaluator unit class.
     * @tparam MR Evaluator result class.
     * @tparam MMR Multiple evaluator results class.
-    * @param dataSourceClassOpt Optional data source class.
-    * @param dataSourceParams Data source parameters.
-    * @param preparatorClassOpt Optional preparator class.
-    * @param preparatorParams Preparator parameters.
+    * @param dataSourceClassMapOpt Optional map of data source class.
+    * @param dataSourceParams Tuple of data source name and parameters.
+    * @param preparatorClassMapOpt Optional map of preparator class.
+    * @param preparatorParams Tuple of preparator name and parameters.
     * @param algorithmClassMapOpt Optional map of algorithm names to classes.
     * @param algorithmParamsList List of instantiated algorithms and their
     *                            parameters.
-    * @param servingClassOpt Optional serving class.
-    * @param servingParams Serving parameters.
+    * @param servingClassMapOpt Optional map of serving class.
+    * @param servingParams Tuple of serving name and parameters.
     * @param evaluatorClassOpt Optional evaluator class.
     * @param evaluatorParams Evaluator parameters.
     * @param params Workflow parameters.
     */
   def run[
-      DP, TD, PD, Q, P, A,
+      EI, TD, PD, Q, P, A,
       MU : ClassTag, MR : ClassTag, MMR <: AnyRef :ClassTag
       ](
-      dataSourceClassOpt
-        : Option[Class[_ <: BaseDataSource[_ <: Params, DP, TD, Q, A]]] = None,
-      dataSourceParams: Params = EmptyParams(),
-      preparatorClassOpt
-        : Option[Class[_ <: BasePreparator[_ <: Params, TD, PD]]] = None,
-      preparatorParams: Params = EmptyParams(),
+      dataSourceClassMapOpt
+        : Option[Map[String, Class[_ <: BaseDataSource[TD, EI, Q, A]]]] = None,
+      dataSourceParams: (String, Params) = ("", EmptyParams()),
+      preparatorClassMapOpt
+        : Option[Map[String, Class[_ <: BasePreparator[TD, PD]]]] = None,
+      preparatorParams: (String, Params) = ("", EmptyParams()),
       algorithmClassMapOpt
-        : Option[Map[String, Class[_ <: BaseAlgorithm[_ <: Params, PD, _, Q, P]]]]
+        : Option[Map[String, Class[_ <: BaseAlgorithm[PD, _, Q, P]]]]
         = None,
       algorithmParamsList: Seq[(String, Params)] = null,
-      servingClassOpt: Option[Class[_ <: BaseServing[_ <: Params, Q, P]]]
+      servingClassMapOpt: Option[Map[String, Class[_ <: BaseServing[Q, P]]]]
         = None,
-      servingParams: Params = EmptyParams(),
+      servingParams: (String, Params) = ("", EmptyParams()),
       evaluatorClassOpt
-        : Option[Class[_ <: BaseEvaluator[_ <: Params, DP, Q, P, A, MU, MR, MMR]]]
+        : Option[Class[_ <: BaseEvaluator[EI, Q, P, A, MU, MR, MMR]]]
         = None,
       evaluatorParams: Params = EmptyParams(),
       params: WorkflowParams = WorkflowParams()
     ) {
 
     CoreWorkflow.runTypeless(
-        dataSourceClassOpt, dataSourceParams,
-        preparatorClassOpt, preparatorParams,
+        dataSourceClassMapOpt, dataSourceParams,
+        preparatorClassMapOpt, preparatorParams,
         algorithmClassMapOpt, algorithmParamsList,
-        servingClassOpt, servingParams,
+        servingClassMapOpt, servingParams,
         evaluatorClassOpt, evaluatorParams,
         params = params
       )

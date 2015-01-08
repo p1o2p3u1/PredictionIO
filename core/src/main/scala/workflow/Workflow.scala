@@ -24,6 +24,7 @@ import io.prediction.controller.PAlgorithm
 import io.prediction.controller.Params
 import io.prediction.controller.Utils
 import io.prediction.controller.NiceRendering
+import io.prediction.controller.SanityCheck
 import io.prediction.controller.java.LJavaDataSource
 import io.prediction.controller.java.LJavaPreparator
 import io.prediction.controller.java.LJavaAlgorithm
@@ -71,11 +72,18 @@ import java.util.{ HashMap => JHashMap, Map => JMap }
 object WorkflowContext extends Logging {
   def apply(
       batch: String = "",
-      env: Map[String, String] = Map()): SparkContext = {
-    val conf = new SparkConf().setAppName(s"PredictionIO: $batch")
-    info(s"Environment received: ${env}")
-    env.map(kv => conf.setExecutorEnv(kv._1, kv._2))
-    info(s"SparkConf executor environment: ${conf.getExecutorEnv}")
+      executorEnv: Map[String, String] = Map(),
+      sparkEnv: Map[String, String] = Map()
+    ): SparkContext = {
+    val conf = new SparkConf()
+    conf.setAppName(s"PredictionIO: ${batch}")
+    debug(s"Executor environment received: ${executorEnv}")
+    executorEnv.map(kv => conf.setExecutorEnv(kv._1, kv._2))
+    debug(s"SparkConf executor environment: ${conf.getExecutorEnv}")
+    debug(s"Application environment received: ${sparkEnv}")
+    conf.setAll(sparkEnv)
+    val sparkConfString = conf.getAll.toSeq
+    debug(s"SparkConf environment: $sparkConfString")
     new SparkContext(conf)
   }
 }
@@ -83,8 +91,8 @@ object WorkflowContext extends Logging {
 // skipOpt = true: use slow parallel model for prediction, requires one extra
 // join stage.
 class AlgoServerWrapper[Q, P, A](
-    val algos: Array[_ <: BaseAlgorithm[_,_,_,Q,P]],
-    val serving: BaseServing[_, Q, P],
+    val algos: Array[_ <: BaseAlgorithm[_,_,Q,P]],
+    val serving: BaseServing[Q, P],
     val skipOpt: Boolean = false,
     val verbose: Int = 0)
 extends Serializable {
@@ -191,14 +199,12 @@ extends Serializable {
     // If all algo support using local model, we will run against all of them
     // in one pass.
     val someNonLocal = algos
-      //.exists(!_.isInstanceOf[LAlgorithm[_, _, _, Q, P]])
       .exists(!_.isInstanceOf[LModelAlgorithm[_, Q, P]])
 
     if (!someNonLocal && !skipOpt) {
       // When algo is local, the model is the only element in RDD[M].
       val localModelAlgo = algos
         .map(_.asInstanceOf[LModelAlgorithm[_, Q, P]])
-        //.map(_.asInstanceOf[LAlgorithm[_, _, _, Q, P]])
       val rddModels = localModelAlgo.zip(models)
         .map{ case (algo, model) => algo.getModel(model) }
       predictLocalModel(rddModels, input)
@@ -210,7 +216,7 @@ extends Serializable {
 
 class EvaluatorWrapper[
     MDP, MQ, MP, MA, MU: ClassTag, MR, MMR <: AnyRef](
-    val evaluator: BaseEvaluator[_,MDP,MQ,MP,MA,MU,MR,MMR])
+    val evaluator: BaseEvaluator[MDP,MQ,MP,MA,MU,MR,MMR])
 extends Serializable {
   def computeUnit[Q, P, A](input: RDD[(Q, P, A)]): RDD[MU] = {
     input
@@ -242,6 +248,7 @@ object CoreWorkflow {
     endTime = DateTime.now,
     engineId = "",
     engineVersion = "",
+    engineVariant = "",
     engineFactory = "",
     evaluatorClass = "",
     batch = "",
@@ -265,14 +272,14 @@ object CoreWorkflow {
   // In particular, evaluator needs to be instantiated to keep scala compiler
   // happy.
   def runEngineTypeless[
-      DP, TD, PD, Q, P, A,
-      MDP, MQ, MP, MA,
+      EI, TD, PD, Q, P, A,
+      MEI, MQ, MP, MA,
       MU, MR, MMR <: AnyRef
       ](
-      engine: Engine[TD, DP, PD, Q, P, A],
+      engine: Engine[TD, EI, PD, Q, P, A],
       engineParams: EngineParams,
       evaluator
-        : BaseEvaluator[_ <: Params, MDP, MQ, MP, MA, MU, MR, MMR] = null,
+        : BaseEvaluator[MEI, MQ, MP, MA, MU, MR, MMR] = null,
       evaluatorParams: Params = EmptyParams(),
       engineInstance: Option[EngineInstance] = None,
       env: Map[String, String] = WorkflowUtils.pioEnvVars,
@@ -282,13 +289,13 @@ object CoreWorkflow {
     runTypeless(
       env = env,
       params = params,
-      dataSourceClassOpt = Some(engine.dataSourceClass),
+      dataSourceClassMapOpt = Some(engine.dataSourceClassMap),
       dataSourceParams = engineParams.dataSourceParams,
-      preparatorClassOpt = Some(engine.preparatorClass),
+      preparatorClassMapOpt = Some(engine.preparatorClassMap),
       preparatorParams = engineParams.preparatorParams,
       algorithmClassMapOpt = Some(engine.algorithmClassMap),
       algorithmParamsList = engineParams.algorithmParamsList,
-      servingClassOpt = Some(engine.servingClass),
+      servingClassMapOpt = Some(engine.servingClassMap),
       servingParams = engineParams.servingParams,
       evaluatorClassOpt = (if (evaluator == null) None else Some(evaluator.getClass)),
       evaluatorParams = evaluatorParams,
@@ -302,25 +309,25 @@ object CoreWorkflow {
   // yipjustin: The parameter list has more than 80 columns. But I cannot find a
   // way to spread it to multiple lines while presving the reability.
   def runTypeless[
-      DP, TD, PD, Q, P, A,
-      MDP, MQ, MP, MA,
+      EI, TD, PD, Q, P, A,
+      MEI, MQ, MP, MA,
       MU : ClassTag, MR : ClassTag, MMR <: AnyRef :ClassTag
       ](
-      dataSourceClassOpt
-        : Option[Class[_ <: BaseDataSource[_ <: Params, DP, TD, Q, A]]] = None,
-      dataSourceParams: Params = EmptyParams(),
-      preparatorClassOpt
-        : Option[Class[_ <: BasePreparator[_ <: Params, TD, PD]]] = None,
-      preparatorParams: Params = EmptyParams(),
+      dataSourceClassMapOpt
+        : Option[Map[String, Class[_ <: BaseDataSource[TD, EI, Q, A]]]] = None,
+      dataSourceParams: (String, Params) = ("", EmptyParams()),
+      preparatorClassMapOpt
+        : Option[Map[String, Class[_ <: BasePreparator[TD, PD]]]] = None,
+      preparatorParams: (String, Params) = ("", EmptyParams()),
       algorithmClassMapOpt
-        : Option[Map[String, Class[_ <: BaseAlgorithm[_ <: Params, PD, _, Q, P]]]]
+        : Option[Map[String, Class[_ <: BaseAlgorithm[PD, _, Q, P]]]]
         = None,
       algorithmParamsList: Seq[(String, Params)] = null,
-      servingClassOpt: Option[Class[_ <: BaseServing[_ <: Params, Q, P]]]
+      servingClassMapOpt: Option[Map[String, Class[_ <: BaseServing[Q, P]]]]
         = None,
-      servingParams: Params = EmptyParams(),
+      servingParams: (String, Params) = ("", EmptyParams()),
       evaluatorClassOpt
-        : Option[Class[_ <: BaseEvaluator[_ <: Params, MDP, MQ, MP, MA, MU, MR, MMR]]]
+        : Option[Class[_ <: BaseEvaluator[MEI, MQ, MP, MA, MU, MR, MMR]]]
         = None,
       evaluatorParams: Params = EmptyParams(),
       engineInstance: Option[EngineInstance] = None,
@@ -333,9 +340,72 @@ object CoreWorkflow {
     evaluatorClassOpt.map(_ => WorkflowUtils.checkUpgrade("evaluation")).
       getOrElse(WorkflowUtils.checkUpgrade("training"))
 
-    val verbose = params.verbose
 
-    val sc = WorkflowContext(params.batch, env)
+    //val sc = WorkflowContext(params.batch, env)
+    val sc = WorkflowContext(params.batch, env, params.sparkEnv)
+
+    runTypelessContext(
+      dataSourceClassMapOpt,
+      dataSourceParams,
+      preparatorClassMapOpt,
+      preparatorParams,
+      algorithmClassMapOpt,
+      algorithmParamsList,
+      servingClassMapOpt,
+      servingParams,
+      evaluatorClassOpt,
+      evaluatorParams,
+      engineInstance,
+      env,
+      params,
+      sc)
+
+    logger.info("Stop spark context")
+    sc.stop()
+
+    logger.info("CoreWorkflow.run completed.")
+
+    if (params.stopAfterRead)
+      logger.info(
+        "Training has stopped after reading from data source and is " +
+        "incomplete.")
+    else if (params.stopAfterPrepare)
+      logger.info(
+        "Training has stopped after data preparation and is incomplete.")
+    else
+      logger.info("Your engine has been trained successfully.")
+  }
+
+  def runTypelessContext[
+      EIN, TD, PD, Q, P, A,
+      MEIN, MQ, MP, MA,
+      MU : ClassTag, MR : ClassTag, MMR <: AnyRef :ClassTag
+      ](
+      dataSourceClassMapOpt
+        : Option[Map[String, Class[_ <: BaseDataSource[TD, EIN, Q, A]]]] = None,
+      dataSourceParams: (String, Params) = ("", EmptyParams()),
+      preparatorClassMapOpt
+        : Option[Map[String, Class[_ <: BasePreparator[TD, PD]]]] = None,
+      preparatorParams: (String, Params) = ("", EmptyParams()),
+      algorithmClassMapOpt
+        : Option[Map[String, Class[_ <: BaseAlgorithm[PD, _, Q, P]]]]
+        = None,
+      algorithmParamsList: Seq[(String, Params)] = null,
+      servingClassMapOpt: Option[Map[String, Class[_ <: BaseServing[Q, P]]]]
+        = None,
+      servingParams: (String, Params) = ("", EmptyParams()),
+      evaluatorClassOpt
+        : Option[Class[_ <: BaseEvaluator[MEIN, MQ, MP, MA, MU, MR, MMR]]]
+        = None,
+      evaluatorParams: Params = EmptyParams(),
+      engineInstance: Option[EngineInstance] = None,
+      env: Map[String, String] = WorkflowUtils.pioEnvVars,
+      params: WorkflowParams = WorkflowParams(),
+      sc: SparkContext
+    ) {
+
+
+    val verbose = params.verbose
 
     // Create an engine instance even for runner as well
     implicit val f = Utils.json4sDefaultFormats
@@ -355,72 +425,126 @@ object CoreWorkflow {
       i.copy(id = iid)
     }
 
+    if (params.skipSanityCheck)
+      logger.info("Data sanity checking is off.")
+    else
+      logger.info("Data sanity checking is on.")
+
     //if (dataSourceClass == null || dataSourceParams == null) {
-    if (dataSourceClassOpt.isEmpty) {
-      logger.info("Dataprep Class or Params is null. Stop here");
+    if (dataSourceClassMapOpt.isEmpty ||
+      dataSourceClassMapOpt.get.get(dataSourceParams._1).isEmpty) {
+      logger.info("Dataprep Class or Params is null. Stop here")
       return
     }
 
     logger.info("Data Source")
-    val dataSource = Doer(dataSourceClassOpt.get, dataSourceParams)
+    val dataSource = Doer(dataSourceClassMapOpt.get.apply(dataSourceParams._1),
+      dataSourceParams._2)
 
     val evalParamsDataMap
-    : Map[EI, (DP, TD, RDD[(Q, A)])] = dataSource
+    : Map[EI, (TD, EIN, RDD[(Q, A)])] = dataSource
       .readBase(sc)
       .zipWithIndex
       .map(_.swap)
       .toMap
 
-    val localParamsSet: Map[EI, DP] = evalParamsDataMap.map {
-      case(ei, e) => (ei -> e._1)
+    val localParamsSet: Map[EI, EIN] = evalParamsDataMap.map {
+      case(ei, e) => (ei -> e._2)
     }
 
     val evalDataMap: Map[EI, (TD, RDD[(Q, A)])] = evalParamsDataMap.map {
-      case(ei, e) => (ei -> (e._2, e._3))
+      case(ei, e) => (ei -> (e._1, e._3))
     }
 
     logger.info(s"Number of training set: ${localParamsSet.size}")
 
-    if (verbose > 2) {
-      evalDataMap.foreach{ case (ei, data) => {
+    if (!params.skipSanityCheck || verbose > 2) {
+      if (!params.skipSanityCheck)
+        logger.info("Performing data sanity check on training data.")
+
+      evalDataMap foreach { case (ei, data) =>
         val (trainingData, testingData) = data
         //val collectedValidationData = testingData.collect
-        val trainingDataStr = WorkflowUtils.debugString(trainingData)
-        val testingDataStrs = testingData.collect
-          .map(WorkflowUtils.debugString)
 
-        logger.info(s"Data Set $ei")
-        logger.info(s"Params: ${localParamsSet(ei)}")
-        logger.info(s"TrainingData:")
-        logger.info(trainingDataStr)
-        logger.info(s"TestingData: (count=${testingDataStrs.length})")
-        testingDataStrs.foreach { logger.info(_) }
-      }}
+        if (!params.skipSanityCheck) {
+          if (trainingData.isInstanceOf[SanityCheck]) {
+            logger.info(
+              s"${trainingData.getClass.getName} supports data sanity check. " +
+              "Performing check.")
+            trainingData.asInstanceOf[SanityCheck].sanityCheck()
+          } else {
+            logger.info(s"${trainingData.getClass.getName} does not support " +
+              "data sanity check. Skipping check.")
+          }
+        }
+
+        if (verbose > 2) {
+          val trainingDataStr = WorkflowUtils.debugString(trainingData)
+          val testingDataStrs = testingData.collect
+            .map(WorkflowUtils.debugString)
+
+          logger.info(s"Data Set $ei")
+          logger.info(s"Params: ${localParamsSet(ei)}")
+          logger.info(s"TrainingData:")
+          logger.info(trainingDataStr)
+          logger.info(s"TestingData: (count=${testingDataStrs.length})")
+          testingDataStrs.foreach { logger.info(_) }
+        }
+      }
     }
 
     logger.info("Data source complete")
 
-    if (preparatorClassOpt.isEmpty) {
-      logger.info("Preparator is null. Stop here")
+    if (params.stopAfterRead) {
+      logger.info("Stopping here because --stop-after-read is set.")
+      return
+    }
+
+    if (preparatorClassMapOpt.isEmpty ||
+      preparatorClassMapOpt.get.get(preparatorParams._1).isEmpty) {
+      logger.info("Preparator is null. Stop here.")
       return
     }
 
     logger.info("Preparator")
-    val preparator = Doer(preparatorClassOpt.get, preparatorParams)
+    val preparator = Doer(preparatorClassMapOpt.get.apply(preparatorParams._1),
+      preparatorParams._2)
 
     val evalPreparedMap: Map[EI, PD] = evalDataMap
     .map{ case (ei, data) => (ei, preparator.prepareBase(sc, data._1)) }
 
-    if (verbose > 2) {
-      evalPreparedMap.foreach{ case (ei, pd) => {
-        val s = WorkflowUtils.debugString(pd)
-        logger.info(s"Prepared Data Set $ei")
-        logger.info(s"Params: ${localParamsSet(ei)}")
-        logger.info(s"PreparedData: $s")
-      }}
+    if (!params.skipSanityCheck || verbose > 2) {
+      if (!params.skipSanityCheck)
+        logger.info("Performing data sanity check on prepared data.")
+
+      evalPreparedMap foreach { case (ei, pd) =>
+        if (!params.skipSanityCheck) {
+          if (pd.isInstanceOf[SanityCheck]) {
+            logger.info(
+              s"${pd.getClass.getName} supports data sanity check. " +
+              "Performing check.")
+              pd.asInstanceOf[SanityCheck].sanityCheck()
+          } else {
+            logger.info(s"${pd.getClass.getName} does not support " +
+              "data sanity check. Skipping check.")
+          }
+        }
+
+        if (verbose > 2) {
+          val s = WorkflowUtils.debugString(pd)
+          logger.info(s"Prepared Data Set $ei")
+          logger.info(s"Params: ${localParamsSet(ei)}")
+          logger.info(s"PreparedData: $s")
+        }
+      }
     }
 
     logger.info("Preparator complete")
+
+    if (params.stopAfterPrepare) {
+      logger.info("Stopping here because --stop-after-prepare is set.")
+      return
+    }
 
     if (algorithmClassMapOpt.isEmpty) {
       logger.info("Algo is null. Stop here")
@@ -430,7 +554,7 @@ object CoreWorkflow {
     logger.info("Algo model construction")
 
     // Instantiate algos
-    val algoInstanceList: Array[BaseAlgorithm[_, PD, _, Q, P]] =
+    val algoInstanceList: Array[BaseAlgorithm[PD, _, Q, P]] =
     algorithmParamsList
       .map {
         case (algoName, algoParams) =>
@@ -480,14 +604,31 @@ object CoreWorkflow {
     .seq
     .toMap
 
-    if (verbose > 2) {
-      evalAlgoModelMap.map{ case(ei, aiModelSeq) => {
-        aiModelSeq.map { case(ai, model) => {
-          val ms = WorkflowUtils.debugString(model)
-          logger.info(s"Model ei: $ei ai: $ai")
-          logger.info(ms)
-        }}
-      }}
+    if (!params.skipSanityCheck || verbose > 2) {
+      if (!params.skipSanityCheck)
+        logger.info("Performing data sanity check on model data.")
+
+      evalAlgoModelMap foreach { case (ei, aiModelSeq) =>
+        aiModelSeq foreach { case (ai, model) =>
+          if (!params.skipSanityCheck) {
+            if (model.isInstanceOf[SanityCheck]) {
+              logger.info(
+                s"${model.getClass.getName} supports data sanity check. " +
+                "Performing check.")
+              model.asInstanceOf[SanityCheck].sanityCheck()
+            } else {
+              logger.info(s"${model.getClass.getName} does not support " +
+                "data sanity check. Skipping check.")
+            }
+          }
+
+          if (verbose > 2) {
+            val ms = WorkflowUtils.debugString(model)
+            logger.info(s"Model ei: $ei ai: $ai")
+            logger.info(ms)
+          }
+        }
+      }
     }
 
     if (evaluatorClassOpt.isEmpty) {
@@ -510,11 +651,13 @@ object CoreWorkflow {
       return
     }
 
-    if (servingClassOpt.isEmpty) {
+    if (servingClassMapOpt.isEmpty ||
+      servingClassMapOpt.get.get(servingParams._1).isEmpty) {
       logger.info("Serving is null. Stop here")
       return
     }
-    val serving = Doer(servingClassOpt.get, servingParams)
+    val serving = Doer(servingClassMapOpt.get.apply(servingParams._1),
+      servingParams._2)
 
     logger.info("Algo prediction")
 
@@ -550,29 +693,6 @@ object CoreWorkflow {
       }}
     }
 
-    //val models: Seq[Seq[Any]] = extractPersistentModels(realEngineInstance,
-    //  evalAlgoModelMap, algorithmParamsList, algoInstanceList)
-/* move this check earlier
-    if (evaluatorClassOpt.isEmpty) {
-      logger.info("Evaluator is null. Stop here")
-      val models: Seq[Seq[Any]] = extractPersistentModels(
-        sc,
-        realEngineInstance,
-        evalAlgoModelMap,
-        algorithmParamsList,
-        algoInstanceList,
-        params
-      )
-
-      saveEngineInstance(
-        realEngineInstance,
-        algorithmParamsList,
-        algoInstanceList,
-        models,
-        None)
-      return
-    }
-*/
     val evaluator = Doer(evaluatorClassOpt.get, evaluatorParams)
     val evaluatorWrapper = new EvaluatorWrapper(evaluator)
 
@@ -589,10 +709,10 @@ object CoreWorkflow {
 
     // Evaluator Set
     val evalEvaluatorResultsMap
-    : Map[EI, RDD[(MDP, MR)]] = evalEvaluatorUnitMap
+    : Map[EI, RDD[(MEIN, MR)]] = evalEvaluatorUnitMap
     .map{ case (ei, evaluatorUnits) => {
       val evaluatorResults
-      : RDD[(MDP, MR)] = evaluatorUnits
+      : RDD[(MEIN, MR)] = evaluatorUnits
         // shuffle must be true, otherwise all upstream stage will be forced to
         // use a single partition.
         .coalesce(numPartitions=1, shuffle = true)
@@ -628,7 +748,6 @@ object CoreWorkflow {
 
     evaluatorOutput foreach { logger.info(_) }
 
-    logger.info("CoreWorkflow.run completed.")
 
     val models: Seq[Seq[Any]] = extractPersistentModels(
       sc,
@@ -666,7 +785,7 @@ object CoreWorkflow {
     realEngineInstance: EngineInstance,
     evalAlgoModelMap: Map[EI, Seq[(AI, Any)]],
     algorithmParamsList: Seq[(String, Params)],
-    algoInstanceList: Array[BaseAlgorithm[_, PD, _, Q, P]],
+    algoInstanceList: Array[BaseAlgorithm[PD, _, Q, P]],
     params: WorkflowParams
   ): Seq[Seq[Any]] = {
 
@@ -704,8 +823,8 @@ object CoreWorkflow {
         val algoParams = algorithmParamsList(ai)._2
 
         // Parallel Model
-        if (algo.isInstanceOf[PAlgorithm[_, _, _, _, _]]
-            || algo.isInstanceOf[PJavaAlgorithm[_, _, _, _, _]]) {
+        if (algo.isInstanceOf[PAlgorithm[_, _, _, _]]
+            || algo.isInstanceOf[PJavaAlgorithm[_, _, _, _]]) {
           if (model.isInstanceOf[IPersistentModel[_]]) {
             getPersistentModel(model, realEngineInstance.id, algoParams)
           } else {
@@ -735,7 +854,7 @@ object CoreWorkflow {
       ](
       realEngineInstance: EngineInstance,
       algorithmParamsList: Seq[(String, Params)],
-      algoInstanceList: Array[BaseAlgorithm[_, PD, _, Q, P]],
+      algoInstanceList: Array[BaseAlgorithm[PD, _, Q, P]],
       models: Seq[Seq[Any]],
       mmr: Option[MMR]
       ): String = {
@@ -744,7 +863,7 @@ object CoreWorkflow {
     val translatedAlgorithmsParams = write(
       algorithmParamsList.zip(algoInstanceList).map {
         case ((name, params), inst) =>
-          if (inst.isInstanceOf[LJavaAlgorithm[_, _, _, _, _]])
+          if (inst.isInstanceOf[LJavaAlgorithm[_, _, _, _]])
             (name -> WorkflowUtils.javaObjectToJValue(params))
           else
             (name -> params)
@@ -802,23 +921,34 @@ object JavaCoreWorkflow {
   // components.
   // Another method is to use JavaEngineBuilder, add only the components you
   // already have. It will handle the missing ones.
-      //DSP <: Params, PP <: Params, SP <: Params, MP <: Params,
   def run[
-      DP, TD, PD, Q, P, A, MU, MR, MMR <: AnyRef](
+      EI, TD, PD, Q, P, A, MU, MR, MMR <: AnyRef](
     env: JMap[String, String] = new JHashMap(),
-    dataSourceClass: Class[_ <: BaseDataSource[_ <: Params, DP, TD, Q, A]],
-    dataSourceParams: Params,
-    preparatorClass: Class[_ <: BasePreparator[_ <: Params, TD, PD]],
-    preparatorParams: Params,
+    dataSourceClassMap: JMap[String, Class[_ <: BaseDataSource[TD, EI, Q, A]]],
+    dataSourceParams: (String, Params),
+    preparatorClassMap: JMap[String, Class[_ <: BasePreparator[TD, PD]]],
+    preparatorParams: (String, Params),
     algorithmClassMap:
-      JMap[String, Class[_ <: BaseAlgorithm[_ <: Params, PD, _, Q, P]]],
+      JMap[String, Class[_ <: BaseAlgorithm[PD, _, Q, P]]],
     algorithmParamsList: JIterable[(String, Params)],
-    servingClass: Class[_ <: BaseServing[_ <: Params, Q, P]],
-    servingParams: Params,
-    evaluatorClass: Class[_ <: BaseEvaluator[_ <: Params, DP, Q, P, A, MU, MR, MMR]],
+    servingClassMap: JMap[String, Class[_ <: BaseServing[Q, P]]],
+    servingParams: (String, Params),
+    evaluatorClass: Class[_ <: BaseEvaluator[EI, Q, P, A, MU, MR, MMR]],
     evaluatorParams: Params,
     params: WorkflowParams
   ) = {
+
+    val scalaDataSourceClassMap =
+      if (dataSourceClassMap == null) null
+      else Map(dataSourceClassMap.toSeq:_ *)
+
+    val scalaPreparatorClassMap =
+      if (preparatorClassMap == null) null
+      else Map(preparatorClassMap.toSeq:_ *)
+
+    val scalaServingClassMap =
+      if (servingClassMap == null) null
+      else Map(servingClassMap.toSeq:_ *)
 
     val scalaAlgorithmClassMap = (
       if (algorithmClassMap == null) null
@@ -831,13 +961,13 @@ object JavaCoreWorkflow {
     CoreWorkflow.runTypeless(
       env = mapAsScalaMap(env).toMap,
       params = params,
-      dataSourceClassOpt = noneIfNull(dataSourceClass),
+      dataSourceClassMapOpt = noneIfNull(scalaDataSourceClassMap),
       dataSourceParams = dataSourceParams,
-      preparatorClassOpt = noneIfNull(preparatorClass),
+      preparatorClassMapOpt = noneIfNull(scalaPreparatorClassMap),
       preparatorParams = preparatorParams,
       algorithmClassMapOpt = noneIfNull(scalaAlgorithmClassMap),
       algorithmParamsList = scalaAlgorithmParamsList,
-      servingClassOpt = noneIfNull(servingClass),
+      servingClassMapOpt = noneIfNull(scalaServingClassMap),
       servingParams = servingParams,
       evaluatorClassOpt = noneIfNull(evaluatorClass),
       evaluatorParams = evaluatorParams

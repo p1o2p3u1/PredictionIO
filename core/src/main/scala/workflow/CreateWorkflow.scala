@@ -49,7 +49,7 @@ object CreateWorkflow extends Logging {
     batch: String = "Transient Lazy Val",
     engineId: String = "",
     engineVersion: String = "",
-    engineFactory: String = "",
+    engineVariant: String = "",
     evaluatorClass: Option[String] = None,
     dataSourceParamsJsonPath: Option[String] = None,
     preparatorParamsJsonPath: Option[String] = None,
@@ -57,23 +57,71 @@ object CreateWorkflow extends Logging {
     servingParamsJsonPath: Option[String] = None,
     evaluatorParamsJsonPath: Option[String] = None,
     jsonBasePath: String = "",
-    env: Option[String] = None)
+    env: Option[String] = None,
+    skipSanityCheck: Boolean = false,
+    stopAfterRead: Boolean = false,
+    stopAfterPrepare: Boolean = false,
+    verbose: Boolean = false,
+    debug: Boolean = false)
 
   case class AlgorithmParams(name: String, params: JValue)
+  case class NameParams(name: String, params: Option[JValue])
 
-  implicit lazy val formats = Utils.json4sDefaultFormats
+  def extractNameParams(jv: JValue): NameParams = {
+    val nameOpt = (jv \ "name").extract[Option[String]]
+    val paramsOpt = (jv \ "params").extract[Option[JValue]]
+
+    if (nameOpt.isEmpty && paramsOpt.isEmpty) {
+      error("Unable to find 'name' or 'params' fields in" +
+        s" ${compact(render(jv))}.\n" +
+        "Since 0.8.4, the 'params' field is required in engine.json" +
+        " in order to specify parameters for DataSource, Preparator or" +
+        " Serving.\n" +
+        "Please go to http://docs.prediction.io/resources/upgrade/" +
+        " for detailed instruction of how to change engine.json.")
+      sys.exit(1)
+    }
+
+    if (nameOpt.isEmpty)
+      info(s"No 'name' is found. Default empty String wil be used.")
+
+    if (paramsOpt.isEmpty)
+      info(s"No 'params' is found. Default EmptyParams will be used.")
+
+    NameParams(
+      name = nameOpt.getOrElse(""),
+      params = paramsOpt
+    )
+  }
+  class NameParamsSerializer extends CustomSerializer[NameParams](format => (
+    {
+      case jv: JValue => extractNameParams(jv)
+    },
+    {
+      case x: NameParams =>
+        JObject(JField("name", JString(x.name)) ::
+          JField("params", x.params.getOrElse(JNothing)) :: Nil)
+    }
+  ))
+
+  implicit lazy val formats = Utils.json4sDefaultFormats +
+    new NameParamsSerializer
 
   val hadoopConf = new Configuration
   val hdfs = FileSystem.get(hadoopConf)
+  val localfs = FileSystem.getLocal(hadoopConf)
 
-  private def stringFromFile(basePath: String, filePath: String): String = {
+  private def stringFromFile(
+      basePath: String,
+      filePath: String,
+      fs: FileSystem = hdfs): String = {
     try {
       val p =
         if (basePath == "")
           new Path(filePath)
         else
           new Path(basePath + Path.SEPARATOR + filePath)
-      new String(ByteStreams.toByteArray(hdfs.open(p)).map(_.toChar))
+      new String(ByteStreams.toByteArray(fs.open(p)).map(_.toChar))
     } catch {
       case e: java.io.IOException =>
         error(s"Error reading from file: ${e.getMessage}. Aborting workflow.")
@@ -92,9 +140,9 @@ object CreateWorkflow extends Logging {
       opt[String]("engineVersion") required() action { (x, c) =>
         c.copy(engineVersion = x)
       } text("Engine's version.")
-      opt[String]("engineFactory") required() action { (x, c) =>
-        c.copy(engineFactory = x)
-      } text("Class name of the engine's factory.")
+      opt[String]("engineVariant") required() action { (x, c) =>
+        c.copy(engineVariant = x)
+      } text("Engine variant JSON.")
       opt[String]("evaluatorClass") action { (x, c) =>
         c.copy(evaluatorClass = Some(x))
       } text("Class name of the run's evaluator.")
@@ -120,11 +168,42 @@ object CreateWorkflow extends Logging {
         c.copy(env = Some(x))
       } text("Comma-separated list of environmental variables (in 'FOO=BAR' " +
         "format) to pass to the Spark execution environment.")
+      opt[Unit]("verbose") action { (x, c) =>
+        c.copy(verbose = true)
+      } text("Enable verbose output.")
+      opt[Unit]("debug") action { (x, c) =>
+        c.copy(debug = true)
+      } text("Enable debug output.")
+      opt[Unit]("skip-sanity-check") action { (x, c) =>
+        c.copy(skipSanityCheck = true)
+      }
+      opt[Unit]("stop-after-read") action { (x, c) =>
+        c.copy(stopAfterRead = true)
+      }
+      opt[Unit]("stop-after-prepare") action { (x, c) =>
+        c.copy(stopAfterPrepare = true)
+      }
     }
 
     parser.parse(args, WorkflowConfig()) map { wfc =>
+      WorkflowUtils.setupLogging(wfc.verbose, wfc.debug)
+      val variantJson = parse(stringFromFile("", wfc.engineVariant, localfs))
+      val engineFactory = variantJson \ "engineFactory" match {
+        case JString(s) => s
+        case _ =>
+          error("Unable to read engine factory class name from " +
+            s"${wfc.engineVariant}. Aborting.")
+          sys.exit(1)
+      }
+      val variantId = variantJson \ "id" match {
+        case JString(s) => s
+        case _ =>
+          error("Unable to read engine variant ID from " +
+            s"${wfc.engineVariant}. Aborting.")
+          sys.exit(1)
+      }
       val (engineLanguage, engine) = try {
-        WorkflowUtils.getEngine(wfc.engineFactory, getClass.getClassLoader)
+        WorkflowUtils.getEngine(engineFactory, getClass.getClassLoader)
       } catch {
         case e @ (_: ClassNotFoundException | _: NoSuchMethodException) =>
           error(s"Unable to obtain engine: ${e.getMessage}. Aborting workflow.")
@@ -133,7 +212,7 @@ object CreateWorkflow extends Logging {
       val evaluator = wfc.evaluatorClass.map { mc => //mc => null
         try {
           Class.forName(mc)
-            .asInstanceOf[Class[BaseEvaluator[_ <: Params, _, _, _, _, _, _, _ <: AnyRef]]]
+            .asInstanceOf[Class[BaseEvaluator[_, _, _, _, _, _, _ <: AnyRef]]]
         } catch {
           case e: ClassNotFoundException =>
             error("Unable to obtain evaluator class object ${mc}: " +
@@ -141,19 +220,108 @@ object CreateWorkflow extends Logging {
             sys.exit(1)
         }
       }
-      val dataSourceParams = wfc.dataSourceParamsJsonPath.map(p =>
-        WorkflowUtils.extractParams(
-          engineLanguage,
-          stringFromFile(wfc.jsonBasePath, p),
-          engine.dataSourceClass)).getOrElse(EmptyParams())
-      val preparatorParams = wfc.preparatorParamsJsonPath.map(p =>
-        WorkflowUtils.extractParams(
-          engineLanguage,
-          stringFromFile(wfc.jsonBasePath, p),
-          engine.preparatorClass)).getOrElse(EmptyParams())
+      //val dataSourceParams = wfc.dataSourceParamsJsonPath.map(p =>
+      //  WorkflowUtils.extractParams(
+      //    engineLanguage,
+      //    stringFromFile(wfc.jsonBasePath, p),
+      //    engine.dataSourceClass)).getOrElse(EmptyParams())
+      info(s"Extracting datasource params...")
+      val dataSourceParams: (String, Params) = variantJson findField {
+        case JField("datasource", _) => true
+        case _ => false
+      } map { jv =>
+        val np: NameParams = try {
+          jv._2.extract[NameParams]
+        } catch {
+          case e: Exception => {
+            error(s"Unable to extract datasource name and params ${jv}")
+            throw e
+          }
+        }
+        val extractedParams = np.params.map { p =>
+          try {
+            if (!engine.dataSourceClassMap.contains(np.name)) {
+              error(s"Unable to find datasource class with name '${np.name}'" +
+                " defined in Engine.")
+              sys.exit(1)
+            }
+            WorkflowUtils.extractParams(
+              engineLanguage,
+              compact(render(p)),
+              engine.dataSourceClassMap(np.name))
+          } catch {
+            case e: Exception => {
+              error(s"Unable to extract datasource params ${p}")
+              throw e
+            }
+          }
+        }.getOrElse(EmptyParams())
+
+        (np.name, extractedParams)
+      } getOrElse ("", EmptyParams())
+      info(s"datasource: ${dataSourceParams}")
+      //val preparatorParams = wfc.preparatorParamsJsonPath.map(p =>
+      //  WorkflowUtils.extractParams(
+      //    engineLanguage,
+      //    stringFromFile(wfc.jsonBasePath, p),
+      //    engine.preparatorClass)).getOrElse(EmptyParams())
+      info(s"Extracting preparator params...")
+      val preparatorParams: (String, Params) = variantJson findField {
+        case JField("preparator", _) => true
+        case _ => false
+      } map { jv =>
+        val np: NameParams = try {
+          jv._2.extract[NameParams]
+        } catch {
+          case e: Exception => {
+            error(s"Unable to extract preparator name and params ${jv}")
+            throw e
+          }
+        }
+        val extractedParams = np.params.map { p =>
+          try {
+            if (!engine.preparatorClassMap.contains(np.name)) {
+              error(s"Unable to find preparator class with name '${np.name}'" +
+                " defined in Engine.")
+              sys.exit(1)
+            }
+            WorkflowUtils.extractParams(
+              engineLanguage,
+              compact(render(p)),
+              engine.preparatorClassMap(np.name))
+          } catch {
+            case e: Exception => {
+              error(s"Unable to extract preparator params ${p}")
+              throw e
+            }
+          }
+        }.getOrElse(EmptyParams())
+        (np.name, extractedParams)
+      } getOrElse ("", EmptyParams())
+      info(s"preparator: ${preparatorParams}")
+      //val algorithmsParams: Seq[(String, Params)] =
+      //  wfc.algorithmsParamsJsonPath.map { p =>
+      //    val algorithmsParamsJson = parse(stringFromFile(wfc.jsonBasePath, p))
+      //    algorithmsParamsJson match {
+      //      case JArray(s) => s.map { algorithmParamsJValue =>
+      //        val eap = algorithmParamsJValue.extract[AlgorithmParams]
+      //        (
+      //          eap.name,
+      //          WorkflowUtils.extractParams(
+      //            engineLanguage,
+      //            compact(render(eap.params)),
+      //            engine.algorithmClassMap(eap.name))
+      //        )
+      //      }
+      //      case _ => Nil
+      //    }
+      //  } getOrElse Seq(("", EmptyParams()))
       val algorithmsParams: Seq[(String, Params)] =
-        wfc.algorithmsParamsJsonPath.map { p =>
-          val algorithmsParamsJson = parse(stringFromFile(wfc.jsonBasePath, p))
+        variantJson findField {
+          case JField("algorithms", _) => true
+          case _ => false
+        } map { jv =>
+          val algorithmsParamsJson = jv._2
           algorithmsParamsJson match {
             case JArray(s) => s.map { algorithmParamsJValue =>
               val eap = algorithmParamsJValue.extract[AlgorithmParams]
@@ -168,11 +336,46 @@ object CreateWorkflow extends Logging {
             case _ => Nil
           }
         } getOrElse Seq(("", EmptyParams()))
-      val servingParams = wfc.servingParamsJsonPath.map(p =>
-        WorkflowUtils.extractParams(
-          engineLanguage,
-          stringFromFile(wfc.jsonBasePath, p),
-          engine.servingClass)).getOrElse(EmptyParams())
+      //val servingParams = wfc.servingParamsJsonPath.map(p =>
+      //  WorkflowUtils.extractParams(
+      //    engineLanguage,
+      //    stringFromFile(wfc.jsonBasePath, p),
+      //    engine.servingClass)).getOrElse(EmptyParams())
+      info(s"Extracting serving params...")
+      val servingParams: (String, Params) = variantJson findField {
+        case JField("serving", _) => true
+        case _ => false
+      } map { jv =>
+        val np: NameParams = try {
+          jv._2.extract[NameParams]
+        } catch {
+          case e: Exception => {
+            error(s"Unable to extract serving name and params ${jv}")
+            throw e
+          }
+        }
+        val extractedParams = np.params.map { p =>
+          try {
+            if (!engine.servingClassMap.contains(np.name)) {
+              error(s"Unable to find serving class with name '${np.name}'" +
+                " defined in Engine.")
+              sys.exit(1)
+            }
+            WorkflowUtils.extractParams(
+              engineLanguage,
+              compact(render(p)),
+              engine.servingClassMap(np.name))
+          } catch {
+            case e: Exception => {
+              error(s"Unable to extract serving params ${p}")
+              throw e
+            }
+          }
+        }.getOrElse(EmptyParams())
+        (np.name, extractedParams)
+      } getOrElse ("", EmptyParams())
+      info(s"serving: ${servingParams}")
+
       val evaluatorParams = wfc.evaluatorParamsJsonPath.map(p =>
         if (evaluator.isEmpty)
           EmptyParams()
@@ -209,7 +412,8 @@ object CreateWorkflow extends Logging {
         endTime = DateTime.now,
         engineId = wfc.engineId,
         engineVersion = wfc.engineVersion,
-        engineFactory = wfc.engineFactory,
+        engineVariant = variantId,
+        engineFactory = engineFactory,
         evaluatorClass = wfc.evaluatorClass.getOrElse(""),
         batch = wfc.batch,
         env = pioEnvVars,
@@ -228,7 +432,10 @@ object CreateWorkflow extends Logging {
         env = pioEnvVars,
         params = WorkflowParams(
           verbose = 3,
-          batch = wfc.batch),
+          batch = wfc.batch,
+          skipSanityCheck = wfc.skipSanityCheck,
+          stopAfterRead = wfc.stopAfterRead,
+          stopAfterPrepare = wfc.stopAfterPrepare),
         engine = engine,
         engineParams = engineParams,
         evaluator = evaluatorInstance,
